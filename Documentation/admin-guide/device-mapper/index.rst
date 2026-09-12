@@ -10,6 +10,7 @@ Device Mapper
     delay
     dm-clone
     dm-crypt
+    dm-default-key
     dm-dust
     dm-ebs
     dm-flakey
