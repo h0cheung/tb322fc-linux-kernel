@@ -48,7 +48,6 @@
 
 #define APM_MAX_SESSIONS			8
 #define APM_LAST_BUFFER_FLAG			BIT(30)
-#define NO_TIMESTAMP				0xFF00
 
 struct q6apm {
 	struct device *dev;

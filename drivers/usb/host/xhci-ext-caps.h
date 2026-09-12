@@ -72,6 +72,7 @@
 /* command register values to disable interrupts and halt the HC */
 /* start/stop HC execution - do not write unless HC is halted*/
 #define XHCI_CMD_RUN		(1 << 0)
+#define XHCI_CMD_RESET		BIT(1)
 /* Event Interrupt Enable - get irq when EINT bit is set in USBSTS register */
 #define XHCI_CMD_EIE		(1 << 2)
 /* Host System Error Interrupt Enable - get irq when HSEIE bit set in USBSTS */

@@ -11,6 +11,7 @@
 #include <linux/clk.h>
 #include <linux/version.h>
 #include <linux/module.h>
+#include <linux/gpio/consumer.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -162,11 +163,54 @@ void dwc3_set_prtcap(struct dwc3 *dwc, u32 mode, bool ignore_susphy)
 }
 EXPORT_SYMBOL_GPL(dwc3_set_prtcap);
 
+/* Removal callbacks cannot report halt errors. Do not reroute a running core. */
+static int dwc3_check_halted(struct dwc3 *dwc)
+{
+	struct resource *res = &dwc->xhci_resources[0];
+	void __iomem *base;
+	u32 reg, offset, command;
+
+	switch (dwc->current_dr_role) {
+	case DWC3_GCTL_PRTCAP_HOST:
+		if (res->flags & IORESOURCE_MEM_NONPOSTED)
+			base = ioremap_np(res->start, resource_size(res));
+		else
+			base = ioremap(res->start, resource_size(res));
+		if (!base)
+			return -ENOMEM;
+		reg = readl(base);
+		offset = XHCI_HC_LENGTH(reg);
+		if (reg == U32_MAX || !offset) {
+			iounmap(base);
+			return -EIO;
+		}
+		reg = readl(base + offset + XHCI_STS_OFFSET);
+		command = readl(base + offset + XHCI_CMD_OFFSET);
+		iounmap(base);
+		if (reg == U32_MAX || command == U32_MAX)
+			return -EIO;
+		if (!(reg & XHCI_STS_HALT) || (reg & XHCI_STS_CNR) ||
+		    (command & (XHCI_CMD_RUN | XHCI_CMD_RESET)))
+			return -EBUSY;
+		return 0;
+	case DWC3_GCTL_PRTCAP_DEVICE:
+		reg = dwc3_readl(dwc, DWC3_DSTS);
+		if (reg == U32_MAX)
+			return -EIO;
+		return reg & DWC3_DSTS_DEVCTRLHLT ? 0 : -EBUSY;
+	default:
+		return 0;
+	}
+}
+
 static void __dwc3_set_mode(struct work_struct *work)
 {
 	struct dwc3 *dwc = work_to_dwc(work);
 	unsigned long flags;
-	int ret;
+	struct dwc3_role_mux *mux = dwc->role_mux;
+	enum usb_role mux_role = USB_ROLE_NONE;
+	int mux_port = 0;
+	int ret = 0;
 	u32 reg;
 	u32 desired_dr_role;
 	int i;
@@ -174,9 +218,18 @@ static void __dwc3_set_mode(struct work_struct *work)
 	mutex_lock(&dwc->mutex);
 	spin_lock_irqsave(&dwc->lock, flags);
 	desired_dr_role = dwc->desired_dr_role;
+	if (mux) {
+		mux_port = mux->desired_port;
+		mux_role = mux->desired_role;
+	}
 	spin_unlock_irqrestore(&dwc->lock, flags);
 
-	pm_runtime_get_sync(dwc->dev);
+	if (mux && READ_ONCE(mux->error))
+		goto unlock;
+
+	ret = pm_runtime_resume_and_get(dwc->dev);
+	if (ret < 0)
+		goto record_error;
 
 	if (dwc->current_dr_role == DWC3_GCTL_PRTCAP_OTG)
 		dwc3_otg_update(dwc, 0);
@@ -184,8 +237,12 @@ static void __dwc3_set_mode(struct work_struct *work)
 	if (!desired_dr_role)
 		goto out;
 
-	if (desired_dr_role == dwc->current_dr_role)
+	if (desired_dr_role == dwc->current_dr_role &&
+	    (!mux || mux_port == mux->active_port)) {
+		if (mux)
+			ret = dwc3_pre_set_role(dwc, mux_role);
 		goto out;
+	}
 
 	if (desired_dr_role == DWC3_GCTL_PRTCAP_OTG && dwc->edev)
 		goto out;
@@ -207,6 +264,15 @@ static void __dwc3_set_mode(struct work_struct *work)
 		break;
 	default:
 		break;
+	}
+
+	if (mux) {
+		ret = dwc3_check_halted(dwc);
+		if (ret)
+			goto mode_failed;
+		ret = dwc3_pre_set_role(dwc, mux_role);
+		if (ret)
+			goto mode_failed;
 	}
 
 	/*
@@ -233,6 +299,16 @@ static void __dwc3_set_mode(struct work_struct *work)
 		dwc3_writel(dwc, DWC3_GCTL, reg);
 	}
 
+	/* The old host/gadget has been removed before changing the data path. */
+	if (mux && mux_port != mux->active_port) {
+		ret = gpiod_direction_output(mux->select, mux_port);
+		if (ret)
+			goto mode_failed;
+		spin_lock_irqsave(&dwc->lock, flags);
+		mux->active_port = mux_port;
+		spin_unlock_irqrestore(&dwc->lock, flags);
+	}
+
 	spin_lock_irqsave(&dwc->lock, flags);
 
 	dwc3_set_prtcap(dwc, desired_dr_role, false);
@@ -241,38 +317,52 @@ static void __dwc3_set_mode(struct work_struct *work)
 
 	switch (desired_dr_role) {
 	case DWC3_GCTL_PRTCAP_HOST:
+		for (i = 0; i < dwc->num_usb2_ports; i++) {
+			ret = phy_set_mode(dwc->usb2_generic_phy[i], PHY_MODE_USB_HOST);
+			if (ret)
+				goto mode_failed;
+		}
+		for (i = 0; i < dwc->num_usb3_ports; i++) {
+			ret = phy_set_mode(dwc->usb3_generic_phy[i], PHY_MODE_USB_HOST);
+			if (ret)
+				goto mode_failed;
+		}
+
 		ret = dwc3_host_init(dwc);
 		if (ret) {
 			dev_err(dwc->dev, "failed to initialize host\n");
-		} else {
-			if (dwc->usb2_phy)
-				otg_set_vbus(dwc->usb2_phy->otg, true);
+			goto mode_failed;
+		}
+		if (dwc->usb2_phy)
+			otg_set_vbus(dwc->usb2_phy->otg, true);
 
-			for (i = 0; i < dwc->num_usb2_ports; i++)
-				phy_set_mode(dwc->usb2_generic_phy[i], PHY_MODE_USB_HOST);
-			for (i = 0; i < dwc->num_usb3_ports; i++)
-				phy_set_mode(dwc->usb3_generic_phy[i], PHY_MODE_USB_HOST);
-
-			if (dwc->dis_split_quirk) {
-				reg = dwc3_readl(dwc, DWC3_GUCTL3);
-				reg |= DWC3_GUCTL3_SPLITDISABLE;
-				dwc3_writel(dwc, DWC3_GUCTL3, reg);
-			}
+		if (dwc->dis_split_quirk) {
+			reg = dwc3_readl(dwc, DWC3_GUCTL3);
+			reg |= DWC3_GUCTL3_SPLITDISABLE;
+			dwc3_writel(dwc, DWC3_GUCTL3, reg);
 		}
 		break;
 	case DWC3_GCTL_PRTCAP_DEVICE:
-		dwc3_core_soft_reset(dwc);
-
-		dwc3_event_buffers_setup(dwc);
+		ret = dwc3_core_soft_reset(dwc);
+		if (ret)
+			goto mode_failed;
 
 		if (dwc->usb2_phy)
 			otg_set_vbus(dwc->usb2_phy->otg, false);
-		phy_set_mode(dwc->usb2_generic_phy[0], PHY_MODE_USB_DEVICE);
-		phy_set_mode(dwc->usb3_generic_phy[0], PHY_MODE_USB_DEVICE);
-
-		ret = dwc3_gadget_init(dwc);
+		ret = phy_set_mode(dwc->usb2_generic_phy[0], PHY_MODE_USB_DEVICE);
 		if (ret)
+			goto mode_failed;
+		ret = phy_set_mode(dwc->usb3_generic_phy[0], PHY_MODE_USB_DEVICE);
+		if (ret)
+			goto mode_failed;
+
+		dwc3_event_buffers_setup(dwc);
+		ret = dwc3_gadget_init(dwc);
+		if (ret) {
 			dev_err(dwc->dev, "failed to initialize peripheral\n");
+			dwc3_event_buffers_cleanup(dwc);
+			goto mode_failed;
+		}
 		break;
 	case DWC3_GCTL_PRTCAP_OTG:
 		dwc3_otg_init(dwc);
@@ -282,8 +372,20 @@ static void __dwc3_set_mode(struct work_struct *work)
 		break;
 	}
 
+	goto out;
+
+mode_failed:
+	spin_lock_irqsave(&dwc->lock, flags);
+	dwc->current_dr_role = 0;
+	spin_unlock_irqrestore(&dwc->lock, flags);
 out:
 	pm_runtime_put_autosuspend(dwc->dev);
+record_error:
+	if (mux && ret) {
+		WRITE_ONCE(mux->error, ret);
+		dev_err(dwc->dev, "connector handover failed: %d\n", ret);
+	}
+unlock:
 	mutex_unlock(&dwc->mutex);
 }
 

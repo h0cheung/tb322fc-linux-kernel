@@ -90,6 +90,18 @@ config VIDEO_GC05A2
 	  To compile this driver as a module, choose M here: the
 	  module will be called gc05a2.
 
+config VIDEO_GC08A8
+	tristate "GalaxyCore GC08A8 sensor support"
+	depends on I2C && VIDEO_DEV
+	select V4L2_CCI_I2C
+	select V4L2_FWNODE
+	help
+	  Support the GalaxyCore GC08A8 image sensor with a 19.2 MHz clock
+	  and four-lane MIPI CSI-2 output at 3264x2448.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called gc08a8.
+
 config VIDEO_GC08A3
 	tristate "GalaxyCore gc08a3 sensor support"
 	select V4L2_CCI_I2C
@@ -793,6 +805,18 @@ config VIDEO_S5K6A3
 	  This is a V4L2 sensor driver for Samsung S5K6A3 raw
 	  camera sensor.
 
+config VIDEO_S5KJNS
+	tristate "Samsung S5KJNS sensor support"
+	depends on I2C && VIDEO_DEV
+	select V4L2_CCI_I2C
+	select V4L2_FWNODE
+	help
+	  Support the Samsung S5KJNS image sensor with a 19.2 MHz clock
+	  and four-lane MIPI CSI-2 output at 4080x3072.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called s5kjns.
+
 config VIDEO_S5KJN1
 	tristate "Samsung S5KJN1 sensor support"
 	select V4L2_CCI_I2C
@@ -917,6 +941,16 @@ config VIDEO_DW9768
 	  DW9768 is a 10 bit DAC with 100mA output current sink
 	  capability. This is designed for linear control of
 	  voice coil motors, controlled via I2C serial interface.
+
+config VIDEO_GT9764
+	tristate "Giantec GT9764 lens actuator support"
+	depends on PM
+	help
+	  This is a driver for the Giantec GT9764 camera lens actuator,
+	  controlled over I2C.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called gt9764.
 
 config VIDEO_DW9807_VCM
 	tristate "DW9807 lens voice coil support"

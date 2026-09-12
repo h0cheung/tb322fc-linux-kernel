@@ -1165,6 +1165,63 @@ static void arm_smmu_master_install_s2crs(struct arm_smmu_master_cfg *cfg,
 	}
 }
 
+static int arm_smmu_map_boot_framebuffer(struct iommu_domain *domain,
+					 struct device *dev)
+{
+	struct device_node *node;
+	struct resource res;
+	phys_addr_t base, translated, addr;
+	size_t size;
+	int ret;
+
+	/* The display is still fetching the MDSS reserved framebuffer. */
+	if (!of_device_is_compatible(dev->of_node, "qcom,sm8750-dpu"))
+		return 0;
+
+	node = of_parse_phandle(dev->parent->of_node, "memory-region", 0);
+	if (!node)
+		return 0;
+	ret = of_address_to_resource(node, 0, &res);
+	of_node_put(node);
+	if (ret)
+		return ret;
+	base = res.start;
+	size = resource_size(&res);
+	if (!size || res.end > DMA_BIT_MASK(32) ||
+	    !IS_ALIGNED(base, SZ_4K) || !IS_ALIGNED(size, SZ_4K))
+		return -EINVAL;
+
+	translated = iommu_iova_to_phys(domain, base);
+	if (translated == base) {
+		/* A pre-existing first page does not prove the whole range exists. */
+		for (addr = base; addr - base < size; addr += SZ_4K)
+			if (iommu_iova_to_phys(domain, addr) != addr)
+				return -EEXIST;
+		return 0;
+	}
+	if (translated)
+		return dev_err_probe(dev, -EEXIST,
+				     "boot framebuffer IOVA is already occupied\n");
+
+	ret = iommu_map(domain, base, base, size, IOMMU_READ, GFP_KERNEL);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to map boot framebuffer before SID switch\n");
+
+	translated = iommu_iova_to_phys(domain, base);
+	dev_info(dev,
+		 "boot framebuffer mapped before SID switch: iova=%pa size=%zx translated=%pa\n",
+		 &base, size, &translated);
+	if (translated != base) {
+		size_t unmapped = iommu_unmap(domain, base, size);
+
+		WARN_ON(unmapped != size);
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
 static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev,
 			       struct iommu_domain *old)
 {
@@ -1204,6 +1261,10 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev,
 		ret = -EINVAL;
 		goto rpm_put;
 	}
+
+	ret = arm_smmu_map_boot_framebuffer(domain, dev);
+	if (ret)
+		goto rpm_put;
 
 	/* Looks ok, so add the device to the domain */
 	arm_smmu_master_install_s2crs(cfg, S2CR_TYPE_TRANS,
@@ -2064,6 +2125,9 @@ static int arm_smmu_device_dt_probe(struct arm_smmu_device *smmu,
 		return -ENODEV;
 	}
 
+	smmu->preserve_boot_mappings =
+		of_property_read_bool(dev->of_node, "qcom,preserve-boot-mappings");
+
 	if (of_dma_is_coherent(dev->of_node))
 		smmu->features |= ARM_SMMU_FEAT_COHERENT_WALK;
 
@@ -2079,6 +2143,9 @@ static void arm_smmu_rmr_install_bypass_smr(struct arm_smmu_device *smmu)
 
 	INIT_LIST_HEAD(&rmr_list);
 	iort_get_rmr_sids(dev_fwnode(smmu->dev), &rmr_list);
+
+	if (smmu->preserve_boot_mappings && list_empty(&rmr_list))
+		return;
 
 	/*
 	 * Rather than trying to look at existing mappings that
@@ -2229,8 +2296,10 @@ static int arm_smmu_device_probe(struct platform_device *pdev)
 	/* Check for RMRs and install bypass SMRs if any */
 	arm_smmu_rmr_install_bypass_smr(smmu);
 
-	arm_smmu_device_reset(smmu);
-	arm_smmu_test_smr_masks(smmu);
+	if (!smmu->preserve_boot_mappings) {
+		arm_smmu_device_reset(smmu);
+		arm_smmu_test_smr_masks(smmu);
+	}
 
 	err = iommu_device_sysfs_add(&smmu->iommu, smmu->dev, NULL,
 				     "smmu.%pa", &smmu->ioaddr);
@@ -2251,9 +2320,11 @@ static int arm_smmu_device_probe(struct platform_device *pdev)
 	 * enable pm_runtime.
 	 */
 	if (dev->pm_domain) {
-		pm_runtime_set_active(dev);
-		pm_runtime_enable(dev);
-		arm_smmu_rpm_use_autosuspend(smmu);
+		if (!smmu->preserve_boot_mappings) {
+			pm_runtime_set_active(dev);
+			pm_runtime_enable(dev);
+			arm_smmu_rpm_use_autosuspend(smmu);
+		}
 	}
 
 	return 0;

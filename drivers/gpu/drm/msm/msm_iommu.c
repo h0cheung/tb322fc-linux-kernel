@@ -7,6 +7,7 @@
 #include <linux/adreno-smmu-priv.h>
 #include <linux/io-pgtable.h>
 #include <linux/kmemleak.h>
+#include <linux/of_address.h>
 #include "msm_drv.h"
 #include "msm_gpu_trace.h"
 #include "msm_mmu.h"
@@ -20,6 +21,9 @@ struct msm_iommu {
 	struct page *prr_page;
 
 	struct kmem_cache *pt_cache;
+
+	phys_addr_t splash_iova;
+	size_t splash_size;
 };
 
 #define to_msm_iommu(x) container_of(x, struct msm_iommu, base)
@@ -710,6 +714,14 @@ static int msm_iommu_unmap(struct msm_mmu *mmu, uint64_t iova, size_t len)
 static void msm_iommu_destroy(struct msm_mmu *mmu)
 {
 	struct msm_iommu *iommu = to_msm_iommu(mmu);
+
+	if (iommu->splash_size) {
+		size_t unmapped;
+
+		unmapped = iommu_unmap(iommu->domain, iommu->splash_iova,
+				       iommu->splash_size);
+		WARN_ON(unmapped != iommu->splash_size);
+	}
 	iommu_domain_free(iommu->domain);
 	kmem_cache_destroy(iommu->pt_cache);
 	kfree(iommu);
@@ -723,11 +735,11 @@ static const struct msm_mmu_funcs funcs = {
 		.set_stall = msm_iommu_set_stall,
 };
 
-struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
+static struct msm_iommu *msm_iommu_alloc(struct device *dev,
+					 unsigned long quirks)
 {
 	struct iommu_domain *domain;
 	struct msm_iommu *iommu;
-	int ret;
 
 	if (!device_iommu_mapped(dev))
 		return ERR_PTR(-ENODEV);
@@ -746,12 +758,23 @@ struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
 
 	iommu->domain = domain;
 	msm_mmu_init(&iommu->base, dev, &funcs, MSM_MMU_IOMMU);
-
 	mutex_init(&iommu->init_lock);
+
+	return iommu;
+}
+
+struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
+{
+	struct msm_iommu *iommu;
+	int ret;
+
+	iommu = msm_iommu_alloc(dev, quirks);
+	if (IS_ERR(iommu))
+		return ERR_CAST(iommu);
 
 	ret = iommu_attach_device(iommu->domain, dev);
 	if (ret) {
-		iommu_domain_free(domain);
+		iommu_domain_free(iommu->domain);
 		kfree(iommu);
 		return ERR_PTR(ret);
 	}
@@ -759,19 +782,78 @@ struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
 	return &iommu->base;
 }
 
+static int msm_iommu_record_boot_framebuffer(struct msm_iommu *iommu)
+{
+	struct device_node *node;
+	struct resource res;
+	phys_addr_t translated;
+	int ret;
+
+	node = of_parse_phandle(iommu->base.dev->parent->of_node,
+				"memory-region", 0);
+	if (!node)
+		return 0;
+
+	ret = of_address_to_resource(node, 0, &res);
+	of_node_put(node);
+	if (ret)
+		return dev_err_probe(iommu->base.dev, ret,
+				     "failed to read continuous-splash region\n");
+
+	translated = iommu_iova_to_phys(iommu->domain, res.start);
+	if (translated != res.start)
+		return dev_err_probe(iommu->base.dev, -EFAULT,
+				     "continuous-splash translation is absent after attach\n");
+
+	iommu->splash_iova = res.start;
+	iommu->splash_size = resource_size(&res);
+
+	return 0;
+}
+
 struct msm_mmu *msm_iommu_disp_new(struct device *dev, unsigned long quirks)
 {
 	struct msm_iommu *iommu;
-	struct msm_mmu *mmu;
+	int ret;
 
-	mmu = msm_iommu_new(dev, quirks);
-	if (IS_ERR(mmu))
-		return mmu;
+	iommu = msm_iommu_alloc(dev, quirks);
+	if (IS_ERR(iommu))
+		return ERR_CAST(iommu);
 
-	iommu = to_msm_iommu(mmu);
+	ret = iommu_attach_device(iommu->domain, dev);
+	if (ret)
+		goto err_free;
+
+	ret = msm_iommu_record_boot_framebuffer(iommu);
+	if (ret)
+		goto err_detach;
+
 	iommu_set_fault_handler(iommu->domain, msm_disp_fault_handler, iommu);
 
-	return mmu;
+	return &iommu->base;
+
+err_detach:
+	iommu_detach_device(iommu->domain, dev);
+err_free:
+	iommu_domain_free(iommu->domain);
+	kfree(iommu);
+	return ERR_PTR(ret);
+}
+
+bool msm_iommu_disp_get_splash(struct msm_mmu *mmu, u64 *iova, size_t *size)
+{
+	struct msm_iommu *iommu;
+
+	if (mmu->type != MSM_MMU_IOMMU)
+		return false;
+
+	iommu = to_msm_iommu(mmu);
+	if (!iommu->splash_size)
+		return false;
+
+	*iova = iommu->splash_iova;
+	*size = iommu->splash_size;
+	return true;
 }
 
 struct msm_mmu *msm_iommu_gpu_new(struct device *dev, struct msm_gpu *gpu, unsigned long quirks)

@@ -61,6 +61,15 @@ properties:
     enum: [ 10, 11 ]
     default: 10
 
+  qcom,cphy-timing-ctrl:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 14
+    maxItems: 14
+    description:
+      Exact values for C-PHY common timing control registers 0 through 13.
+      This may be used when board-qualified panel timings differ from the
+      generic timing calculator.
+
 required:
   - compatible
   - reg

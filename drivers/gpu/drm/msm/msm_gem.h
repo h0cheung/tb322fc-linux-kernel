@@ -107,6 +107,9 @@ struct msm_gem_vm {
 	 */
 	struct drm_mm mm;
 
+	/** @reserved_node: Fixed firmware IOVA excluded from managed allocation. */
+	struct drm_mm_node reserved_node;
+
 	/** @mmu: The mmu object which manages the pgtables */
 	struct msm_mmu *mmu;
 
@@ -159,6 +162,7 @@ struct msm_gem_vm {
 struct drm_gpuvm *
 msm_gem_vm_create(struct drm_device *drm, struct msm_mmu *mmu, const char *name,
 		  u64 va_start, u64 va_size, bool managed);
+int msm_gem_vm_reserve(struct drm_gpuvm *gpuvm, u64 start, u64 size);
 
 void msm_gem_vm_close(struct drm_gpuvm *gpuvm);
 void msm_gem_vm_unusable(struct drm_gpuvm *gpuvm);
@@ -264,6 +268,8 @@ struct msm_gem_object {
 
 void msm_gem_vma_get(struct drm_gem_object *obj);
 void msm_gem_vma_put(struct drm_gem_object *obj);
+void msm_gem_sync_for_cpu(struct drm_gem_object *obj);
+void msm_gem_sync_for_device(struct drm_gem_object *obj);
 
 int msm_gem_prot(struct drm_gem_object *obj);
 int msm_gem_pin_vma_locked(struct drm_gem_object *obj, struct drm_gpuva *vma);

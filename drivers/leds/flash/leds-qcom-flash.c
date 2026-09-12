@@ -4,6 +4,11 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/delay.h>
+#include <linux/devm-helpers.h>
+#include <linux/jiffies.h>
+#include <linux/math64.h>
+#include <linux/power_supply.h>
 #include <linux/bits.h>
 #include <linux/leds.h>
 #include <linux/led-class-flash.h>
@@ -15,7 +20,7 @@
 
 /* registers definitions */
 #define FLASH_REVISION_REG		0x00
-#define FLASH_4CH_REVISION_V0P1		0x01
+#define FLASH_4CH_REVISION_V2P0		0x01
 
 #define FLASH_TYPE_REG			0x04
 #define FLASH_TYPE_VAL			0x18
@@ -75,16 +80,21 @@
 #define FLASH_TIMEOUT_STEP_US		10000
 
 #define UA_PER_MA			1000
+#define FLASH_LMH_CURRENT_UA		1000000
+#define FLASH_BATTERY_CURRENT_MAX_UA	4500000
+#define FLASH_LED_VOLTAGE_MV		3900
+#define FLASH_CONVERTER_EFFICIENCY	900
 
 /* thermal threshold constants */
 #define OTST_3CH_MIN_VAL		3
 #define OTST1_4CH_MIN_VAL		0
-#define OTST1_4CH_V0P1_MIN_VAL		3
+#define OTST1_4CH_V1P0_MIN_VAL		3
 #define OTST2_4CH_MIN_VAL		0
 
 #define OTST1_MAX_CURRENT_MA		1000
 #define OTST2_MAX_CURRENT_MA		500
 #define OTST3_MAX_CURRENT_MA		200
+#define OTST1_4CH_MAX_CURRENT_MA		200
 
 enum hw_type {
 	QCOM_MVFLASH_3CH,
@@ -115,6 +125,7 @@ enum {
 	REG_THERM_THRSH2,
 	REG_THERM_THRSH3,
 	REG_TORCH_CLAMP,
+	REG_MITIGATION_SW,
 	REG_MAX_COUNT,
 };
 
@@ -163,17 +174,22 @@ static const struct reg_field mvflash_4ch_regs[REG_MAX_COUNT] = {
 	[REG_THERM_THRSH1]	= REG_FIELD(0x7a, 0, 2),
 	[REG_THERM_THRSH2]	= REG_FIELD(0x78, 0, 2),
 	[REG_TORCH_CLAMP]	= REG_FIELD(0xed, 0, 6),
+	[REG_MITIGATION_SW]	= REG_FIELD(0x65, 0, 0),
 };
 
 struct qcom_flash_data {
-	struct v4l2_flash	**v4l2_flash;
+	struct power_supply	*battery;
+	u32			battery_current_limit_ua;
+	u32			battery_voltage_min_uv;
+	u32			strobe_current_ua;
+	int			lmh_enabled;
 	struct regmap_field     *r_fields[REG_MAX_COUNT];
 	struct mutex		lock;
 	enum hw_type		hw_type;
-	u32			total_ma;
-	u8			leds_count;
+	u32			total_ua;
 	u8			max_channels;
 	u8			chan_en_bits;
+	u8			used_channels;
 	u8			revision;
 	u8			torch_clamp;
 };
@@ -181,63 +197,181 @@ struct qcom_flash_data {
 struct qcom_flash_led {
 	struct qcom_flash_data		*flash_data;
 	struct led_classdev_flash	flash;
-	u32				max_flash_current_ma;
-	u32				max_torch_current_ma;
+	struct delayed_work		timeout_work;
+	unsigned long			strobe_deadline;
+	enum led_mode			mode;
+	bool				timer_armed;
+	u32				max_flash_current_ua;
+	u32				max_torch_current_ua;
 	u32				max_timeout_ms;
-	u32				flash_current_ma;
+	u32				flash_current_ua;
 	u32				flash_timeout_ms;
-	u32				current_in_use_ma;
+	u32				current_in_use_ua;
 	u8				*chan_id;
 	u8				chan_count;
 	bool				enabled;
 };
 
+struct qcom_flash_supply_match {
+	struct fwnode_handle *fwnode;
+	struct power_supply *battery;
+};
+
+static int qcom_flash_match_battery(struct power_supply *psy, void *data)
+{
+	struct qcom_flash_supply_match *match = data;
+
+	/* Some firmware nodes expose battery, USB and wireless supplies together. */
+	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY || !psy->dev.parent ||
+	    dev_fwnode(psy->dev.parent) != match->fwnode)
+		return 0;
+	if (match->battery)
+		return -EINVAL;
+
+	match->battery = power_supply_get_by_name(psy->desc->name);
+	return match->battery ? 0 : -EPROBE_DEFER;
+}
+
+static void qcom_flash_put_battery(void *data)
+{
+	power_supply_put(data);
+}
+
+static int qcom_flash_get_battery(struct device *dev, struct qcom_flash_data *flash_data)
+{
+	struct qcom_flash_supply_match match = {};
+	int rc;
+
+	if (!device_property_present(dev, "power-supplies"))
+		return 0;
+
+	rc = device_property_read_u32(dev, "qcom,battery-current-limit-microamp",
+				      &flash_data->battery_current_limit_ua);
+	if (rc)
+		return rc;
+	if (!flash_data->battery_current_limit_ua ||
+	    flash_data->battery_current_limit_ua > FLASH_BATTERY_CURRENT_MAX_UA)
+		return -EINVAL;
+
+	rc = device_property_read_u32(dev, "qcom,battery-voltage-min-microvolt",
+				      &flash_data->battery_voltage_min_uv);
+	if (rc)
+		return rc;
+	if (!flash_data->battery_voltage_min_uv)
+		return -EINVAL;
+
+	match.fwnode = fwnode_find_reference(dev_fwnode(dev), "power-supplies", 0);
+	if (IS_ERR(match.fwnode))
+		return PTR_ERR(match.fwnode);
+
+	rc = power_supply_for_each_psy(&match, qcom_flash_match_battery);
+	fwnode_handle_put(match.fwnode);
+	if (rc) {
+		if (match.battery)
+			power_supply_put(match.battery);
+		return rc;
+	}
+	if (!match.battery)
+		return -EPROBE_DEFER;
+
+	flash_data->battery = match.battery;
+	return devm_add_action_or_reset(dev, qcom_flash_put_battery, match.battery);
+}
+
+static int get_battery_flash_current(struct qcom_flash_data *flash_data, u32 *current_ua)
+{
+	union power_supply_propval resistance, ocv, battery_current;
+	s64 safe_ua, discharge_ua, voltage_uv, power_uw, available_ua;
+	int rc;
+
+	if (!flash_data->battery)
+		return 0;
+
+	rc = power_supply_get_property(flash_data->battery, POWER_SUPPLY_PROP_INTERNAL_RESISTANCE,
+				       &resistance);
+	if (rc)
+		return rc;
+	rc = power_supply_get_property(flash_data->battery, POWER_SUPPLY_PROP_VOLTAGE_OCV, &ocv);
+	if (rc)
+		return rc;
+	rc = power_supply_get_property(flash_data->battery, POWER_SUPPLY_PROP_CURRENT_NOW,
+				       &battery_current);
+	if (rc)
+		return rc;
+	if (resistance.intval <= 0 || ocv.intval <= 0)
+		return -ENODATA;
+
+	voltage_uv = (s64)ocv.intval - flash_data->battery_voltage_min_uv;
+	if (voltage_uv <= 0) {
+		*current_ua = 0;
+		return 0;
+	}
+	safe_ua = min_t(s64, flash_data->battery_current_limit_ua,
+			div_s64(voltage_uv * 1000000, resistance.intval));
+	/* Charging power can disappear when USB is disconnected; do not budget it. */
+	discharge_ua = max_t(s64, 0, -(s64)battery_current.intval);
+	if (discharge_ua >= safe_ua) {
+		*current_ua = 0;
+		return 0;
+	}
+
+	voltage_uv = (s64)ocv.intval - div_s64(safe_ua * resistance.intval, 1000000);
+	power_uw = div_s64(voltage_uv * (safe_ua - discharge_ua), 1000000);
+	/* 3.5 V LED drop + 400 mV headroom, with 90% converter efficiency. */
+	available_ua = div_s64(power_uw * FLASH_CONVERTER_EFFICIENCY, FLASH_LED_VOLTAGE_MV);
+	*current_ua = min_t(s64, *current_ua, available_ua);
+	return 0;
+}
+
+static int set_flash_mitigation(struct qcom_flash_data *flash_data)
+{
+	bool enable = flash_data->strobe_current_ua >= FLASH_LMH_CURRENT_UA;
+	int rc;
+
+	if (flash_data->hw_type != QCOM_MVFLASH_4CH || enable == flash_data->lmh_enabled)
+		return 0;
+
+	rc = regmap_field_write(flash_data->r_fields[REG_MITIGATION_SW], enable);
+	if (rc) {
+		/* The write may have reached the PMIC despite the transport error. */
+		flash_data->lmh_enabled = -1;
+		return rc;
+	}
+	flash_data->lmh_enabled = enable;
+	if (enable)
+		usleep_range(500, 600);
+
+	return 0;
+}
+
 static int set_flash_module_en(struct qcom_flash_led *led, bool en)
 {
 	struct qcom_flash_data *flash_data = led->flash_data;
-	u8 led_mask = 0, enable;
+	u8 led_mask = 0, chan_en;
 	int i, rc;
 
 	for (i = 0; i < led->chan_count; i++)
 		led_mask |= BIT(led->chan_id[i]);
 
-	mutex_lock(&flash_data->lock);
+	chan_en = flash_data->chan_en_bits;
 	if (en)
-		flash_data->chan_en_bits |= led_mask;
+		chan_en |= led_mask;
 	else
-		flash_data->chan_en_bits &= ~led_mask;
+		chan_en &= ~led_mask;
 
-	enable = !!flash_data->chan_en_bits;
-	rc = regmap_field_write(flash_data->r_fields[REG_MODULE_EN], enable);
-	if (rc)
-		dev_err(led->flash.led_cdev.dev, "write module_en failed, rc=%d\n", rc);
-	mutex_unlock(&flash_data->lock);
+	rc = regmap_field_write(flash_data->r_fields[REG_MODULE_EN], !!chan_en);
+	if (!rc)
+		flash_data->chan_en_bits = chan_en;
 
 	return rc;
 }
 
-static int update_allowed_flash_current(struct qcom_flash_led *led, u32 *current_ma, bool strobe)
+static int get_allowed_flash_current(struct qcom_flash_led *led, u32 *current_ua)
 {
 	struct qcom_flash_data *flash_data = led->flash_data;
-	u32 therm_ma, avail_ma, thrsh[3], min_thrsh, sts;
-	int rc = 0;
-
-	mutex_lock(&flash_data->lock);
-	/*
-	 * Put previously allocated current into allowed budget in either of these two cases:
-	 * 1) LED is disabled;
-	 * 2) LED is enabled repeatedly
-	 */
-	if (!strobe || led->current_in_use_ma != 0) {
-		if (flash_data->total_ma >= led->current_in_use_ma)
-			flash_data->total_ma -= led->current_in_use_ma;
-		else
-			flash_data->total_ma = 0;
-
-		led->current_in_use_ma = 0;
-		if (!strobe)
-			goto unlock;
-	}
+	u32 therm_ma, avail_ua, thrsh[3], min_thrsh, sts;
+	int count = flash_data->hw_type == QCOM_MVFLASH_3CH ? 3 : 2;
+	int rc, ret, i;
 
 	/*
 	 * Cache the default thermal threshold settings, and set them to the lowest levels before
@@ -248,26 +382,26 @@ static int update_allowed_flash_current(struct qcom_flash_led *led, u32 *current
 	 */
 	rc = regmap_field_read(flash_data->r_fields[REG_THERM_THRSH1], &thrsh[0]);
 	if (rc < 0)
-		goto unlock;
+		return rc;
 
 	rc = regmap_field_read(flash_data->r_fields[REG_THERM_THRSH2], &thrsh[1]);
 	if (rc < 0)
-		goto unlock;
+		return rc;
 
 	if (flash_data->hw_type == QCOM_MVFLASH_3CH) {
 		rc = regmap_field_read(flash_data->r_fields[REG_THERM_THRSH3], &thrsh[2]);
 		if (rc < 0)
-			goto unlock;
+			return rc;
 	}
 
 	min_thrsh = OTST_3CH_MIN_VAL;
 	if (flash_data->hw_type == QCOM_MVFLASH_4CH)
-		min_thrsh = (flash_data->revision == FLASH_4CH_REVISION_V0P1) ?
-			OTST1_4CH_V0P1_MIN_VAL : OTST1_4CH_MIN_VAL;
+		min_thrsh = (flash_data->revision == FLASH_4CH_REVISION_V2P0) ?
+			OTST1_4CH_MIN_VAL : OTST1_4CH_V1P0_MIN_VAL;
 
 	rc = regmap_field_write(flash_data->r_fields[REG_THERM_THRSH1], min_thrsh);
 	if (rc < 0)
-		goto unlock;
+		goto restore;
 
 	if (flash_data->hw_type == QCOM_MVFLASH_4CH)
 		min_thrsh = OTST2_4CH_MIN_VAL;
@@ -300,44 +434,33 @@ static int update_allowed_flash_current(struct qcom_flash_led *led, u32 *current
 		else if (sts & FLASH_STS_3CH_OTST1)
 			therm_ma = OTST1_MAX_CURRENT_MA;
 	} else {
-		if (sts & FLASH_STS_4CH_OTST2)
+		if (sts & FLASH_STS_4CH_OTST1)
+			therm_ma = OTST1_4CH_MAX_CURRENT_MA;
+		else if (sts & FLASH_STS_4CH_OTST2)
 			therm_ma = OTST2_MAX_CURRENT_MA;
-		else if (sts & FLASH_STS_4CH_OTST1)
-			therm_ma = OTST1_MAX_CURRENT_MA;
 	}
 
-	/* Calculate the allowed flash current for the request */
-	if (therm_ma <= flash_data->total_ma)
-		avail_ma = 0;
-	else
-		avail_ma = therm_ma - flash_data->total_ma;
-
-	*current_ma = min_t(u32, *current_ma, avail_ma);
-	led->current_in_use_ma = *current_ma;
-	flash_data->total_ma += led->current_in_use_ma;
-
-	dev_dbg(led->flash.led_cdev.dev, "allowed flash current: %dmA, total current: %dmA\n",
-					led->current_in_use_ma, flash_data->total_ma);
-
 restore:
-	/* Restore to default thermal threshold settings */
-	rc = regmap_field_write(flash_data->r_fields[REG_THERM_THRSH1], thrsh[0]);
-	if (rc < 0)
-		goto unlock;
+	/* Try all restores, preserving the first error. Never enable on a failed check. */
+	for (i = 0; i < count; i++) {
+		ret = regmap_field_write(flash_data->r_fields[REG_THERM_THRSH1 + i], thrsh[i]);
+		if (!rc)
+			rc = ret;
+	}
+	if (rc)
+		return rc;
 
-	rc = regmap_field_write(flash_data->r_fields[REG_THERM_THRSH2], thrsh[1]);
-	if (rc < 0)
-		goto unlock;
+	avail_ua = therm_ma * UA_PER_MA;
+	if (avail_ua <= flash_data->total_ua)
+		avail_ua = 0;
+	else
+		avail_ua -= flash_data->total_ua;
 
-	if (flash_data->hw_type == QCOM_MVFLASH_3CH)
-		rc = regmap_field_write(flash_data->r_fields[REG_THERM_THRSH3], thrsh[2]);
-
-unlock:
-	mutex_unlock(&flash_data->lock);
-	return rc;
+	*current_ua = min(*current_ua, avail_ua);
+	return 0;
 }
 
-static int set_flash_current(struct qcom_flash_led *led, u32 current_ma, enum led_mode mode)
+static int set_flash_current(struct qcom_flash_led *led, u32 current_ua, enum led_mode mode)
 {
 	struct qcom_flash_data *flash_data = led->flash_data;
 	u32 itarg_ua, ires_ua;
@@ -348,14 +471,11 @@ static int set_flash_current(struct qcom_flash_led *led, u32 current_ma, enum le
 	 * Split the current across the channels and set the
 	 * IRESOLUTION and ITARGET registers accordingly.
 	 */
-	itarg_ua = (current_ma * UA_PER_MA) / led->chan_count + 1;
+	itarg_ua = current_ua / led->chan_count;
 	ires_ua = (mode == FLASH_MODE) ? FLASH_IRES_UA : TORCH_IRES_UA;
 
 	for (i = 0; i < led->chan_count; i++) {
-		u8 itarget = 0;
-
-		if (itarg_ua > ires_ua)
-			itarget = itarg_ua / ires_ua - 1;
+		u8 itarget = itarg_ua / ires_ua - 1;
 
 		chan_id = led->chan_id[i];
 
@@ -397,11 +517,12 @@ static int set_flash_timeout(struct qcom_flash_led *led, u32 timeout_ms)
 	for (i = 0; i < led->chan_count; i++) {
 		chan_id = led->chan_id[i];
 
-		timer = timeout_ms / FLASH_TIMER_STEP_MS;
-		timer = clamp_t(u8, timer, 0, FLASH_TIMER_VAL_MASK);
-
-		if (timeout_ms)
+		timer = 0;
+		if (timeout_ms) {
+			timer = clamp_t(u32, timeout_ms / FLASH_TIMER_STEP_MS,
+					1, FLASH_TIMER_VAL_MASK + 1) - 1;
 			timer |= FLASH_TIMER_EN_BIT;
+		}
 
 		rc = regmap_fields_write(flash_data->r_fields[REG_CHAN_TIMER], chan_id, timer);
 		if (rc)
@@ -417,9 +538,12 @@ static int set_flash_strobe(struct qcom_flash_led *led, enum led_strobe strobe, 
 	u8 strobe_sel, chan_en, chan_id, chan_mask = 0;
 	int rc, i;
 
-	/* Set SW strobe config for all channels connected to the LED */
+	/* Configure the strobe only when enabling; disabling must clear channels first. */
 	for (i = 0; i < led->chan_count; i++) {
 		chan_id = led->chan_id[i];
+		chan_mask |= BIT(chan_id);
+		if (!state)
+			continue;
 
 		if (strobe == SW_STROBE)
 			strobe_sel = FIELD_PREP(FLASH_STROBE_HW_SW_SEL_BIT, SW_STROBE_VAL);
@@ -434,8 +558,6 @@ static int set_flash_strobe(struct qcom_flash_led *led, enum led_strobe strobe, 
 				flash_data->r_fields[REG_CHAN_STROBE], chan_id, strobe_sel);
 		if (rc)
 			return rc;
-
-		chan_mask |= BIT(chan_id);
 	}
 
 	/* Enable/disable flash channels */
@@ -448,6 +570,128 @@ static int set_flash_strobe(struct qcom_flash_led *led, enum led_strobe strobe, 
 	return 0;
 }
 
+/* The caller holds flash_data->lock across each complete hardware transition. */
+static int qcom_flash_disable(struct qcom_flash_led *led)
+{
+	struct qcom_flash_data *flash_data = led->flash_data;
+	int rc, ret;
+
+	led->timer_armed = false;
+	cancel_delayed_work(&led->timeout_work);
+	rc = set_flash_strobe(led, SW_STROBE, false);
+	if (rc)
+		return rc;
+
+	flash_data->total_ua -= led->current_in_use_ua;
+	if (led->mode == FLASH_MODE)
+		flash_data->strobe_current_ua -= led->current_in_use_ua;
+	led->current_in_use_ua = 0;
+	rc = set_flash_module_en(led, false);
+	ret = set_flash_mitigation(flash_data);
+	return rc ? rc : ret;
+}
+
+static void qcom_flash_timeout_work(struct work_struct *work)
+{
+	struct qcom_flash_led *led = container_of(to_delayed_work(work),
+						struct qcom_flash_led, timeout_work);
+	int rc;
+
+	mutex_lock(&led->flash_data->lock);
+	if (!led->timer_armed)
+		goto unlock;
+	/* An old timeout may have started running while a new strobe held the lock. */
+	if (time_before(jiffies, led->strobe_deadline)) {
+		mod_delayed_work(system_dfl_wq, &led->timeout_work, led->strobe_deadline - jiffies);
+		goto unlock;
+	}
+
+	rc = qcom_flash_disable(led);
+	if (rc)
+		dev_err(led->flash.led_cdev.dev, "flash timeout cleanup failed: %d\n", rc);
+unlock:
+	mutex_unlock(&led->flash_data->lock);
+}
+
+static int qcom_flash_apply(struct qcom_flash_led *led, u32 current_ua,
+			    enum led_mode mode, enum led_strobe strobe, bool enable)
+{
+	struct qcom_flash_data *flash_data = led->flash_data;
+	u32 step_ua = led->chan_count * (mode == FLASH_MODE ? FLASH_IRES_UA : TORCH_IRES_UA);
+	int rc, ret;
+
+	mutex_lock(&flash_data->lock);
+	rc = qcom_flash_disable(led);
+	if (rc || !enable)
+		goto unlock;
+
+	if (mode == FLASH_MODE)
+		current_ua = led->flash_current_ua;
+
+	rc = get_allowed_flash_current(led, &current_ua);
+	if (rc)
+		goto unlock;
+	rc = get_battery_flash_current(flash_data, &current_ua);
+	if (rc)
+		goto unlock;
+
+	current_ua = rounddown(current_ua, step_ua);
+	if (!current_ua) {
+		rc = -EBUSY;
+		goto unlock;
+	}
+
+	led->mode = mode;
+	led->current_in_use_ua = current_ua;
+	flash_data->total_ua += current_ua;
+	if (mode == FLASH_MODE)
+		flash_data->strobe_current_ua += current_ua;
+	rc = set_flash_current(led, current_ua, mode);
+	if (rc)
+		goto disable;
+
+	rc = set_flash_timeout(led, mode == FLASH_MODE ? led->flash_timeout_ms : 0);
+	if (rc)
+		goto disable;
+
+	rc = set_flash_mitigation(flash_data);
+	if (rc)
+		goto disable;
+	rc = set_flash_module_en(led, true);
+	if (rc)
+		goto disable;
+
+	rc = set_flash_strobe(led, strobe, true);
+	if (!rc) {
+		if (mode == FLASH_MODE && strobe == SW_STROBE) {
+			led->timer_armed = true;
+			led->strobe_deadline = jiffies + msecs_to_jiffies(led->flash_timeout_ms);
+			mod_delayed_work(system_dfl_wq, &led->timeout_work,
+					 msecs_to_jiffies(led->flash_timeout_ms));
+		}
+		goto unlock;
+	}
+
+disable:
+	ret = qcom_flash_disable(led);
+	if (ret)
+		dev_err(led->flash.led_cdev.dev, "flash disable failed: %d\n", ret);
+unlock:
+	mutex_unlock(&flash_data->lock);
+	return rc;
+}
+
+static u32 qcom_flash_torch_current(struct qcom_flash_led *led, enum led_brightness brightness)
+{
+	u32 step_ua = TORCH_IRES_UA * led->chan_count;
+	u32 current_ua = brightness * led->max_torch_current_ua / LED_FULL;
+
+	if (!brightness)
+		return 0;
+
+	return max(step_ua, rounddown(current_ua, step_ua));
+}
+
 static inline struct qcom_flash_led *flcdev_to_qcom_fled(struct led_classdev_flash *flcdev)
 {
 	return container_of(flcdev, struct qcom_flash_led, flash);
@@ -457,7 +701,9 @@ static int qcom_flash_brightness_set(struct led_classdev_flash *fled_cdev, u32 b
 {
 	struct qcom_flash_led *led = flcdev_to_qcom_fled(fled_cdev);
 
-	led->flash_current_ma = min_t(u32, led->max_flash_current_ma, brightness / UA_PER_MA);
+	mutex_lock(&led->flash_data->lock);
+	led->flash_current_ua = min(brightness, led->max_flash_current_ua);
+	mutex_unlock(&led->flash_data->lock);
 	return 0;
 }
 
@@ -465,43 +711,26 @@ static int qcom_flash_timeout_set(struct led_classdev_flash *fled_cdev, u32 time
 {
 	struct qcom_flash_led *led = flcdev_to_qcom_fled(fled_cdev);
 
+	mutex_lock(&led->flash_data->lock);
 	led->flash_timeout_ms = timeout / USEC_PER_MSEC;
+	mutex_unlock(&led->flash_data->lock);
 	return 0;
 }
 
 static int qcom_flash_strobe_set(struct led_classdev_flash *fled_cdev, bool state)
 {
 	struct qcom_flash_led *led = flcdev_to_qcom_fled(fled_cdev);
-	int rc;
 
-	rc = set_flash_strobe(led, SW_STROBE, false);
-	if (rc)
-		return rc;
-
-	rc = update_allowed_flash_current(led, &led->flash_current_ma, state);
-	if (rc < 0)
-		return rc;
-
-	rc = set_flash_current(led, led->flash_current_ma, FLASH_MODE);
-	if (rc)
-		return rc;
-
-	rc = set_flash_timeout(led, led->flash_timeout_ms);
-	if (rc)
-		return rc;
-
-	rc = set_flash_module_en(led, state);
-	if (rc)
-		return rc;
-
-	return set_flash_strobe(led, SW_STROBE, state);
+	return qcom_flash_apply(led, 0, FLASH_MODE, SW_STROBE, state);
 }
 
 static int qcom_flash_strobe_get(struct led_classdev_flash *fled_cdev, bool *state)
 {
 	struct qcom_flash_led *led = flcdev_to_qcom_fled(fled_cdev);
 
+	mutex_lock(&led->flash_data->lock);
 	*state = led->enabled;
+	mutex_unlock(&led->flash_data->lock);
 	return 0;
 }
 
@@ -586,36 +815,9 @@ static int qcom_flash_led_brightness_set(struct led_classdev *led_cdev,
 {
 	struct led_classdev_flash *fled_cdev = lcdev_to_flcdev(led_cdev);
 	struct qcom_flash_led *led = flcdev_to_qcom_fled(fled_cdev);
-	u32 current_ma = brightness * led->max_torch_current_ma / LED_FULL;
-	bool enable = !!brightness;
-	int rc;
 
-	rc = set_flash_strobe(led, SW_STROBE, false);
-	if (rc)
-		return rc;
-
-	rc = set_flash_module_en(led, false);
-	if (rc)
-		return rc;
-
-	rc = update_allowed_flash_current(led, &current_ma, enable);
-	if (rc < 0)
-		return rc;
-
-	rc = set_flash_current(led, current_ma, TORCH_MODE);
-	if (rc)
-		return rc;
-
-	/* Disable flash timeout for torch LED */
-	rc = set_flash_timeout(led, 0);
-	if (rc)
-		return rc;
-
-	rc = set_flash_module_en(led, enable);
-	if (rc)
-		return rc;
-
-	return set_flash_strobe(led, SW_STROBE, enable);
+	return qcom_flash_apply(led, qcom_flash_torch_current(led, brightness),
+				TORCH_MODE, SW_STROBE, !!brightness);
 }
 
 static const struct led_flash_ops qcom_flash_ops = {
@@ -627,20 +829,16 @@ static const struct led_flash_ops qcom_flash_ops = {
 };
 
 #if IS_ENABLED(CONFIG_V4L2_FLASH_LED_CLASS)
+static void qcom_flash_v4l2_release(void *data)
+{
+	v4l2_flash_release(data);
+}
+
 static int qcom_flash_external_strobe_set(struct v4l2_flash *v4l2_flash, bool enable)
 {
-	struct led_classdev_flash *fled_cdev = v4l2_flash->fled_cdev;
-	struct qcom_flash_led *led = flcdev_to_qcom_fled(fled_cdev);
-	int rc;
+	struct qcom_flash_led *led = flcdev_to_qcom_fled(v4l2_flash->fled_cdev);
 
-	rc = set_flash_module_en(led, enable);
-	if (rc)
-		return rc;
-
-	if (enable)
-		return set_flash_strobe(led, HW_STROBE, true);
-	else
-		return set_flash_strobe(led, SW_STROBE, false);
+	return qcom_flash_apply(led, 0, FLASH_MODE, HW_STROBE, enable);
 }
 
 static enum led_brightness
@@ -648,13 +846,9 @@ qcom_flash_intensity_to_led_brightness(struct v4l2_flash *v4l2_flash, s32 intens
 {
 	struct led_classdev_flash *fled_cdev = v4l2_flash->fled_cdev;
 	struct qcom_flash_led *led = flcdev_to_qcom_fled(fled_cdev);
-	u32 current_ma = intensity / UA_PER_MA;
+	u32 current_ua = min_t(u32, intensity, led->max_torch_current_ua);
 
-	current_ma = min_t(u32, current_ma, led->max_torch_current_ma);
-	if (!current_ma)
-		return LED_OFF;
-
-	return (current_ma * LED_FULL) / led->max_torch_current_ma;
+	return DIV_ROUND_UP(current_ua * LED_FULL, led->max_torch_current_ua);
 }
 
 static s32 qcom_flash_brightness_to_led_intensity(struct v4l2_flash *v4l2_flash,
@@ -663,7 +857,7 @@ static s32 qcom_flash_brightness_to_led_intensity(struct v4l2_flash *v4l2_flash,
 	struct led_classdev_flash *fled_cdev = v4l2_flash->fled_cdev;
 	struct qcom_flash_led *led = flcdev_to_qcom_fled(fled_cdev);
 
-	return (brightness * led->max_torch_current_ma * UA_PER_MA) / LED_FULL;
+	return qcom_flash_torch_current(led, brightness);
 }
 
 static const struct v4l2_flash_ops qcom_v4l2_flash_ops = {
@@ -675,7 +869,6 @@ static const struct v4l2_flash_ops qcom_v4l2_flash_ops = {
 static int
 qcom_flash_v4l2_init(struct device *dev, struct qcom_flash_led *led, struct fwnode_handle *fwnode)
 {
-	struct qcom_flash_data *flash_data = led->flash_data;
 	struct v4l2_flash_config v4l2_cfg = { 0 };
 	struct led_flash_setting *intensity = &v4l2_cfg.intensity;
 	struct v4l2_flash *v4l2_flash;
@@ -684,7 +877,7 @@ qcom_flash_v4l2_init(struct device *dev, struct qcom_flash_led *led, struct fwno
 		return 0;
 
 	intensity->min = intensity->step = TORCH_IRES_UA * led->chan_count;
-	intensity->max = led->max_torch_current_ma * UA_PER_MA;
+	intensity->max = led->max_torch_current_ua;
 	intensity->val = min_t(u32, intensity->max, TORCH_CURRENT_DEFAULT_UA);
 
 	strscpy(v4l2_cfg.dev_name, led->flash.led_cdev.dev->kobj.name,
@@ -701,8 +894,7 @@ qcom_flash_v4l2_init(struct device *dev, struct qcom_flash_led *led, struct fwno
 	if (IS_ERR(v4l2_flash))
 		return PTR_ERR(v4l2_flash);
 
-	flash_data->v4l2_flash[flash_data->leds_count] = v4l2_flash;
-	return 0;
+	return devm_add_action_or_reset(dev, qcom_flash_v4l2_release, v4l2_flash);
 }
 # else
 static int
@@ -756,6 +948,9 @@ static int qcom_flash_register_led_device(struct device *dev,
 
 		/* Make chan_id indexing from 0 */
 		led->chan_id[i] = channels[i] - 1;
+		if (flash_data->used_channels & BIT(led->chan_id[i]))
+			return dev_err_probe(dev, -EINVAL, "Duplicate LED source\n");
+		flash_data->used_channels |= BIT(led->chan_id[i]);
 	}
 
 	rc = fwnode_property_read_u32(node, "led-max-microamp", &current_ua);
@@ -764,13 +959,11 @@ static int qcom_flash_register_led_device(struct device *dev,
 		return rc;
 	}
 
-	if (current_ua == 0) {
-		dev_err(dev, "led-max-microamp shouldn't be 0\n");
-		return -EINVAL;
-	}
-
 	current_ua = min_t(u32, current_ua, TORCH_CURRENT_MAX_UA * led->chan_count);
-	led->max_torch_current_ma = current_ua / UA_PER_MA;
+	current_ua = rounddown(current_ua, TORCH_IRES_UA * led->chan_count);
+	if (!current_ua)
+		return -EINVAL;
+	led->max_torch_current_ua = current_ua;
 
 	torch_clamp = (current_ua / led->chan_count) / TORCH_IRES_UA;
 	if (torch_clamp != 0)
@@ -790,6 +983,9 @@ static int qcom_flash_register_led_device(struct device *dev,
 
 		current_ua = min_t(u32, current_ua, FLASH_CURRENT_MAX_UA * led->chan_count);
 		current_ua = min_t(u32, current_ua, FLASH_TOTAL_CURRENT_MAX_UA);
+		current_ua = rounddown(current_ua, FLASH_IRES_UA * led->chan_count);
+		if (!current_ua)
+			return -EINVAL;
 
 		/* Initialize flash class LED device brightness settings */
 		brightness = &flash->brightness;
@@ -797,8 +993,8 @@ static int qcom_flash_register_led_device(struct device *dev,
 		brightness->max = current_ua;
 		brightness->val = min_t(u32, current_ua, FLASH_CURRENT_DEFAULT_UA);
 
-		led->max_flash_current_ma = current_ua / UA_PER_MA;
-		led->flash_current_ma = brightness->val / UA_PER_MA;
+		led->max_flash_current_ua = current_ua;
+		led->flash_current_ua = brightness->val;
 
 		rc = fwnode_property_read_u32(node, "flash-max-timeout-us", &timeout_us);
 		if (rc < 0) {
@@ -808,6 +1004,9 @@ static int qcom_flash_register_led_device(struct device *dev,
 		}
 
 		timeout_us = min_t(u32, timeout_us, FLASH_TIMEOUT_MAX_US);
+		timeout_us = rounddown(timeout_us, FLASH_TIMEOUT_STEP_US);
+		if (!timeout_us)
+			return -EINVAL;
 
 		/* Initialize flash class LED device timeout settings */
 		timeout = &flash->timeout;
@@ -819,6 +1018,11 @@ static int qcom_flash_register_led_device(struct device *dev,
 		flash->ops = &qcom_flash_ops;
 	}
 
+	rc = devm_delayed_work_autocancel(dev, &led->timeout_work, qcom_flash_timeout_work);
+	if (rc)
+		return rc;
+
+	flash->led_cdev.flags |= LED_CORE_SUSPENDRESUME;
 	flash->led_cdev.brightness_set_blocking = qcom_flash_led_brightness_set;
 
 	init_data.fwnode = node;
@@ -922,8 +1126,26 @@ static int qcom_flash_led_probe(struct platform_device *pdev)
 	}
 	devm_kfree(dev, regs); /* devm_regmap_field_bulk_alloc() makes copies */
 
-	platform_set_drvdata(pdev, flash_data);
-	mutex_init(&flash_data->lock);
+	rc = qcom_flash_get_battery(dev, flash_data);
+	if (rc)
+		return dev_err_probe(dev, rc, "Failed to get flash battery supply\n");
+
+	rc = devm_mutex_init(dev, &flash_data->lock);
+	if (rc)
+		return rc;
+
+	/* Do not inherit armed channels from firmware when enabling the module. */
+	rc = regmap_field_write(flash_data->r_fields[REG_CHAN_EN], 0);
+	if (rc)
+		return rc;
+	rc = regmap_field_write(flash_data->r_fields[REG_MODULE_EN], 0);
+	if (rc)
+		return rc;
+	if (flash_data->hw_type == QCOM_MVFLASH_4CH) {
+		rc = regmap_field_write(flash_data->r_fields[REG_MITIGATION_SW], 0);
+		if (rc)
+			return rc;
+	}
 
 	count = device_get_child_node_count(dev);
 	if (count == 0 || count > flash_data->max_channels) {
@@ -931,41 +1153,18 @@ static int qcom_flash_led_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	flash_data->v4l2_flash = devm_kcalloc(dev, count,
-			sizeof(*flash_data->v4l2_flash), GFP_KERNEL);
-	if (!flash_data->v4l2_flash)
-		return -ENOMEM;
-
 	device_for_each_child_node_scoped(dev, child) {
 		led = devm_kzalloc(dev, sizeof(*led), GFP_KERNEL);
-		if (!led) {
-			rc = -ENOMEM;
-			goto release;
-		}
+		if (!led)
+			return -ENOMEM;
 
 		led->flash_data = flash_data;
 		rc = qcom_flash_register_led_device(dev, child, led);
 		if (rc < 0)
-			goto release;
-
-		flash_data->leds_count++;
+			return rc;
 	}
 
 	return regmap_field_write(flash_data->r_fields[REG_TORCH_CLAMP], flash_data->torch_clamp);
-release:
-	while (flash_data->v4l2_flash[flash_data->leds_count] && flash_data->leds_count)
-		v4l2_flash_release(flash_data->v4l2_flash[flash_data->leds_count--]);
-	return rc;
-}
-
-static void qcom_flash_led_remove(struct platform_device *pdev)
-{
-	struct qcom_flash_data *flash_data = platform_get_drvdata(pdev);
-
-	while (flash_data->v4l2_flash[flash_data->leds_count] && flash_data->leds_count)
-		v4l2_flash_release(flash_data->v4l2_flash[flash_data->leds_count--]);
-
-	mutex_destroy(&flash_data->lock);
 }
 
 static const struct of_device_id qcom_flash_led_match_table[] = {
@@ -980,7 +1179,6 @@ static struct platform_driver qcom_flash_led_driver = {
 		.of_match_table = qcom_flash_led_match_table,
 	},
 	.probe = qcom_flash_led_probe,
-	.remove = qcom_flash_led_remove,
 };
 
 module_platform_driver(qcom_flash_led_driver);

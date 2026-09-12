@@ -298,6 +298,9 @@ struct qcom_battmgr_usb {
 	unsigned int current_max;
 	unsigned int current_limit;
 	unsigned int usb_type;
+	unsigned int adapter_type;
+	int requested_current_limit;
+	bool current_limit_set;
 };
 
 struct qcom_battmgr_wireless {
@@ -325,6 +328,7 @@ struct qcom_battmgr {
 	struct completion ack;
 
 	bool service_up;
+	bool current_inverted;
 
 	struct qcom_battmgr_info info;
 	struct qcom_battmgr_status status;
@@ -561,6 +565,11 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		val->intval = battmgr->status.current_now;
+		if (battmgr->current_inverted) {
+			if (val->intval == INT_MIN)
+				return -ERANGE;
+			val->intval = -val->intval;
+		}
 		break;
 	case POWER_SUPPLY_PROP_POWER_NOW:
 		val->intval = battmgr->status.power_now;
@@ -1043,6 +1052,62 @@ static int qcom_battmgr_usb_get_property(struct power_supply *psy,
 	return 0;
 }
 
+/* Called with battmgr->lock held, like every other property transaction. */
+static int qcom_battmgr_set_usb_current_limit(struct qcom_battmgr *battmgr, int ua)
+{
+	int ret;
+
+	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+					    USB_ADAP_TYPE, 0);
+	if (ret)
+		return ret;
+
+	/* Other charger types negotiate their input limit in firmware. */
+	switch (battmgr->usb.adapter_type) {
+	case POWER_SUPPLY_USB_TYPE_SDP:
+	case POWER_SUPPLY_USB_TYPE_CDP:
+	case POWER_SUPPLY_USB_TYPE_PD:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					    USB_INPUT_CURR_LIMIT, ua);
+}
+
+static int qcom_battmgr_usb_set_property(struct power_supply *psy,
+					 enum power_supply_property psp,
+					 const union power_supply_propval *val)
+{
+	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+	int ret;
+
+	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT || val->intval < 0)
+		return -EINVAL;
+
+	mutex_lock(&battmgr->lock);
+	if (!battmgr->service_up) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	ret = qcom_battmgr_set_usb_current_limit(battmgr, val->intval);
+	if (!ret) {
+		battmgr->usb.requested_current_limit = val->intval;
+		battmgr->usb.current_limit_set = true;
+	}
+out:
+	mutex_unlock(&battmgr->lock);
+	return ret;
+}
+
+static int qcom_battmgr_usb_is_writeable(struct power_supply *psy,
+					 enum power_supply_property psp)
+{
+	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
+}
+
 static const enum power_supply_property sc8280xp_usb_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 };
@@ -1081,6 +1146,8 @@ static const struct power_supply_desc sm8350_usb_psy_desc = {
 	.properties = sm8350_usb_props,
 	.num_properties = ARRAY_SIZE(sm8350_usb_props),
 	.get_property = qcom_battmgr_usb_get_property,
+	.set_property = qcom_battmgr_usb_set_property,
+	.property_is_writeable = qcom_battmgr_usb_is_writeable,
 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
 		     BIT(POWER_SUPPLY_USB_TYPE_SDP)     |
 		     BIT(POWER_SUPPLY_USB_TYPE_DCP)     |
@@ -1480,6 +1547,14 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			break;
 		}
 		break;
+	case BATTMGR_USB_PROPERTY_SET:
+		if (payload_len != sizeof(resp->intval) ||
+		    le32_to_cpu(resp->intval.property) != USB_INPUT_CURR_LIMIT) {
+			battmgr->error = -EPROTO;
+			break;
+		}
+		battmgr->error = le32_to_cpu(resp->intval.result) ? -EREMOTEIO : 0;
+		break;
 	case BATTMGR_USB_PROPERTY_GET:
 		property = le32_to_cpu(resp->intval.property);
 		if (payload_len != sizeof(resp->intval)) {
@@ -1509,6 +1584,9 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			break;
 		case USB_CURR_MAX:
 			battmgr->usb.current_max = le32_to_cpu(resp->intval.value);
+			break;
+		case USB_ADAP_TYPE:
+			battmgr->usb.adapter_type = le32_to_cpu(resp->intval.value);
 			break;
 		case USB_INPUT_CURR_LIMIT:
 			battmgr->usb.current_limit = le32_to_cpu(resp->intval.value);
@@ -1594,9 +1672,21 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	};
 	int ret;
 
+	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
-	if (ret)
+	if (ret) {
 		dev_err(battmgr->dev, "failed to request power notifications\n");
+		goto out;
+	}
+
+	if (battmgr->usb.current_limit_set) {
+		ret = qcom_battmgr_set_usb_current_limit(battmgr,
+							 battmgr->usb.requested_current_limit);
+		if (ret)
+			dev_warn(battmgr->dev, "failed to restore USB current limit: %d\n", ret);
+	}
+out:
+	mutex_unlock(&battmgr->lock);
 }
 
 static void qcom_battmgr_pdr_notify(void *priv, int state)
@@ -1640,6 +1730,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		return -ENOMEM;
 
 	battmgr->dev = dev;
+	battmgr->current_inverted = device_property_read_bool(dev->parent,
+							      "qcom,battery-current-inverted");
 
 	psy_cfg.drv_data = battmgr;
 	psy_cfg.fwnode = dev_fwnode(&adev->dev);
@@ -1690,6 +1782,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
 					     "failed to register wireless charing power supply\n");
 	} else {
+		battmgr->unit = QCOM_BATTMGR_UNIT_mAh;
+
 		if (battmgr->variant == QCOM_BATTMGR_SM8550)
 			psy_desc = &sm8550_bat_psy_desc;
 		else

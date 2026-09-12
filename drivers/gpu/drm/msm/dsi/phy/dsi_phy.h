@@ -116,6 +116,8 @@ struct msm_dsi_phy {
 	enum msm_dsi_phy_usecase usecase;
 	bool regulator_ldo_mode;
 	bool cphy_mode;
+	bool has_cphy_timing_ctrl;
+	u8 cphy_timing_ctrl[14];
 
 	struct clk_hw *vco_hw;
 	bool pll_on;

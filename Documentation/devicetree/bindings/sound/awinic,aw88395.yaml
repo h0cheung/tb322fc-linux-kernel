@@ -23,6 +23,7 @@ properties:
       - awinic,aw88261
       - awinic,aw88395
       - awinic,aw88399
+      - awinic,aw88461
 
   reg:
     maxItems: 1
@@ -60,6 +61,16 @@ required:
 
 allOf:
   - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          const: awinic,aw88461
+    then:
+      required:
+        - reset-gpios
+        - firmware-name
+      properties:
+        awinic,sync-flag: false
   - if:
       properties:
         compatible:

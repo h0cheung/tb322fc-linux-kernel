@@ -141,6 +141,33 @@ static void sync_for_cpu(struct msm_gem_object *msm_obj)
 	dma_unmap_sgtable(dev, msm_obj->sgt, DMA_BIDIRECTIONAL, 0);
 }
 
+void msm_gem_sync_for_cpu(struct drm_gem_object *obj)
+{
+	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+
+	if (!(msm_obj->flags & MSM_BO_WC) || !msm_obj->sgt)
+		return;
+
+	dma_sync_sgtable_for_cpu(obj->dev->dev, msm_obj->sgt,
+				 DMA_BIDIRECTIONAL);
+}
+
+void msm_gem_sync_for_device(struct drm_gem_object *obj)
+{
+	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+
+	if (!(msm_obj->flags & MSM_BO_WC) || !msm_obj->sgt)
+		return;
+
+	/*
+	 * WC objects remain DMA-mapped between get_pages() and put_pages().
+	 * Return the existing mapping to the device after CPU packet writes;
+	 * do not create a second DMA mapping for the DSI command buffer.
+	 */
+	dma_sync_sgtable_for_device(obj->dev->dev, msm_obj->sgt,
+				    DMA_BIDIRECTIONAL);
+}
+
 static void update_lru_active(struct drm_gem_object *obj)
 {
 	struct msm_drm_private *priv = obj->dev->dev_private;

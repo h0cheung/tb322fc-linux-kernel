@@ -147,6 +147,7 @@ enum {
  */
 enum {
 	DPU_DSC_NATIVE_42x_EN = 0x1,
+	DPU_DSC_FULL_ICH_PREC,
 	DPU_DSC_MAX
 };
 

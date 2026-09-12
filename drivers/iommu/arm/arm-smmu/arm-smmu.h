@@ -287,6 +287,7 @@ struct arm_smmu_smr {
 };
 
 struct arm_smmu_device {
+	bool preserve_boot_mappings;
 	struct device			*dev;
 
 	void __iomem			*base;

@@ -634,13 +634,26 @@ disable_clocks:
 static void cci_remove(struct platform_device *pdev)
 {
 	struct cci *cci = platform_get_drvdata(pdev);
-	int i;
+	struct device *dev = &pdev->dev;
+	int i, ret;
+
+	/* Keep the controller clocked until the adapters and queues are stopped. */
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		dev_err(dev, "Failed to resume CCI for removal: %d\n", ret);
 
 	for (i = 0; i < cci->data->num_masters; i++) {
 		if (cci->master[i].cci) {
 			i2c_del_adapter(&cci->master[i].adap);
-			cci_halt(cci, i);
+			if (ret >= 0)
+				cci_halt(cci, i);
 		}
+	}
+
+	disable_irq(cci->irq);
+	if (ret >= 0) {
+		cci_disable_clocks(cci);
+		pm_runtime_put_noidle(dev);
 	}
 }
 

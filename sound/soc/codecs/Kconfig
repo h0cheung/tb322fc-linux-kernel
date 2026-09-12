@@ -662,6 +662,19 @@ config SND_SOC_AW8738
 	  SND_SOC_SIMPLE_AMPLIFIER, but additionally allows setting the
 	  operation mode using the Awinic-specific one-wire pulse control.
 
+config SND_SOC_AW88461
+	tristate "Awinic AW88461 I2S amplifier"
+	depends on I2C
+	select REGMAP_I2C
+	select GPIOLIB
+	select FW_LOADER
+	select SND_SOC_AW88395_LIB
+	help
+	  Enable playback through the Awinic AW88461 amplifier, using the
+	  speaker tuning image named in devicetree.
+	  To compile this driver as a module, choose M here: the module
+	  will be called snd-soc-aw88461.
+
 config SND_SOC_AW88395_LIB
 	select CRC8
 	tristate

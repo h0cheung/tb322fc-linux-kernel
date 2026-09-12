@@ -58,6 +58,12 @@ properties:
   '#size-cells':
     const: 0
 
+  qcom,battery-current-inverted:
+    type: boolean
+    description:
+      The firmware reports negative battery current while charging and positive
+      current while discharging, opposite to the power supply interface convention.
+
   orientation-gpios:
     description: Array of input gpios for the Type-C connector orientation indication.
       The GPIO indication is used to detect the orientation of the Type-C connector.

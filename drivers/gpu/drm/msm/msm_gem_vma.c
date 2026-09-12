@@ -160,6 +160,8 @@ msm_gem_vm_free(struct drm_gpuvm *gpuvm)
 {
 	struct msm_gem_vm *vm = container_of(gpuvm, struct msm_gem_vm, base);
 
+	if (drm_mm_node_allocated(&vm->reserved_node))
+		drm_mm_remove_node(&vm->reserved_node);
 	drm_mm_takedown(&vm->mm);
 	if (vm->mmu)
 		vm->mmu->funcs->destroy(vm->mmu);
@@ -892,6 +894,19 @@ err_free_dummy:
 err_free_vm:
 	kfree(vm);
 	return ERR_PTR(ret);
+}
+
+int msm_gem_vm_reserve(struct drm_gpuvm *gpuvm, u64 start, u64 size)
+{
+	struct msm_gem_vm *vm = to_msm_vm(gpuvm);
+
+	if (!vm->managed || drm_mm_node_allocated(&vm->reserved_node))
+		return -EINVAL;
+
+	vm->reserved_node.start = start;
+	vm->reserved_node.size = size;
+
+	return drm_mm_reserve_node(&vm->mm, &vm->reserved_node);
 }
 
 /**

@@ -2432,6 +2432,22 @@ config ARM64_ACPI_PARKING_PROTOCOL
 	  protocol even if the corresponding data is present in the ACPI
 	  MADT table.
 
+config BUILTIN_DTB
+	bool "Built-in device tree"
+	depends on OF
+	select GENERIC_BUILTIN_DTB
+	help
+	  Link a selected device tree into the kernel and use it instead of
+	  the tree supplied by the bootloader. The resulting image is specific
+	  to that hardware. This is useful when the bootloader cannot pass
+	  a suitable device tree. If unsure, say N.
+
+config BUILTIN_DTB_NAME
+	string "Built-in device tree source"
+	depends on BUILTIN_DTB
+	help
+	  DTS path without suffix, relative to arch/arm64/boot/dts.
+
 config CMDLINE
 	string "Default kernel command string"
 	default ""

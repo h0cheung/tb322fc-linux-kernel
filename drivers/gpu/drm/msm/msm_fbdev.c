@@ -40,6 +40,7 @@ static int msm_fbdev_mmap(struct fb_info *info, struct vm_area_struct *vma)
 static void msm_fbdev_fb_destroy(struct fb_info *info)
 {
 	struct drm_fb_helper *helper = (struct drm_fb_helper *)info->par;
+	struct msm_drm_private *priv = helper->dev->dev_private;
 	struct drm_framebuffer *fb = helper->fb;
 	struct drm_gem_object *bo = msm_framebuffer_bo(fb, 0);
 
@@ -49,6 +50,8 @@ static void msm_fbdev_fb_destroy(struct fb_info *info)
 
 	/* this will free the backing object */
 	msm_gem_put_vaddr(bo);
+	msm_gem_unpin_iova(bo, priv->kms->vm);
+	msm_gem_vma_put(bo);
 	drm_framebuffer_remove(fb);
 
 	drm_client_release(&helper->client);
@@ -120,10 +123,11 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 	 * in panic (ie. lock-safe, etc) we could avoid pinning the
 	 * buffer now:
 	 */
+	msm_gem_vma_get(bo);
 	ret = msm_gem_get_and_pin_iova(bo, priv->kms->vm, &paddr);
 	if (ret) {
 		DRM_DEV_ERROR(dev->dev, "failed to get buffer obj iova: %d\n", ret);
-		goto fail;
+		goto fail_vma;
 	}
 
 	DBG("fbi=%p, dev=%p", fbi, dev);
@@ -138,8 +142,9 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 	fbi->screen_buffer = msm_gem_get_vaddr(bo);
 	if (IS_ERR(fbi->screen_buffer)) {
 		ret = PTR_ERR(fbi->screen_buffer);
-		goto fail;
+		goto fail_pin;
 	}
+	fbi->flags |= FBINFO_VIRTFB;
 	fbi->screen_size = bo->size;
 	fbi->fix.smem_start = paddr;
 	fbi->fix.smem_len = bo->size;
@@ -149,7 +154,11 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 
 	return 0;
 
-fail:
+fail_pin:
+	msm_gem_unpin_iova(bo, priv->kms->vm);
+fail_vma:
+	msm_gem_vma_put(bo);
+	helper->fb = NULL;
 	drm_framebuffer_remove(fb);
 	return ret;
 }

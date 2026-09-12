@@ -36,6 +36,35 @@ properties:
   reg:
     maxItems: 1
 
+  power-supplies:
+    description:
+      Provider of the battery supplying the flash controller. If the provider
+      exposes multiple power supplies, exactly one must be of battery type.
+      The battery must supply open-circuit voltage, current and internal resistance.
+    maxItems: 1
+
+  qcom,battery-current-limit-microamp:
+    description: Maximum battery discharge current allowed during a flash.
+    minimum: 1
+    maximum: 4500000
+
+  qcom,battery-voltage-min-microvolt:
+    description: Minimum loaded battery voltage, including the required droop margin.
+    minimum: 1
+
+allOf:
+  - if:
+      required:
+        - power-supplies
+    then:
+      required:
+        - qcom,battery-current-limit-microamp
+        - qcom,battery-voltage-min-microvolt
+
+dependentRequired:
+  qcom,battery-current-limit-microamp: [power-supplies]
+  qcom,battery-voltage-min-microvolt: [power-supplies]
+
 patternProperties:
   "^led-[0-3]$":
     type: object

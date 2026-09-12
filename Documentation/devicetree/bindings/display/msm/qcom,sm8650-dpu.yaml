@@ -33,6 +33,9 @@ properties:
       - description: Address offset and size for mdp register set
       - description: Address offset and size for vbif register set
 
+  iommus:
+    maxItems: 1
+
   reg-names:
     items:
       - const: mdp

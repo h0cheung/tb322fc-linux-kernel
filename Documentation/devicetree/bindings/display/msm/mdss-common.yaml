@@ -20,6 +20,18 @@ description:
 select:
   false
 
+# The IOMMU can be attached to MDSS or to the DPU child.
+allOf:
+  - if:
+      not:
+        required:
+          - iommus
+    then:
+      patternProperties:
+        "^display-controller@[0-9a-f]+$":
+          required:
+            - iommus
+
 properties:
   $nodename:
     pattern: "^display-subsystem@[0-9a-f]+$"
@@ -100,7 +112,6 @@ required:
   - clocks
   - interrupts
   - interrupt-controller
-  - iommus
   - ranges
 
 additionalProperties: true

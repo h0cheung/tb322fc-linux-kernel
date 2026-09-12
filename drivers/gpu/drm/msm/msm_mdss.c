@@ -466,6 +466,42 @@ static const struct dev_pm_ops mdss_pm_ops = {
 	SET_RUNTIME_PM_OPS(mdss_runtime_suspend, mdss_runtime_resume, NULL)
 };
 
+static int mdss_prepopulate_dsi_phys(struct device *dev)
+{
+	struct platform_device *created[2];
+	struct platform_device *child_pdev;
+	struct device_node *child;
+	unsigned int count = 0;
+	int ret = 0;
+
+	for_each_available_child_of_node(dev->of_node, child) {
+		if (!of_device_is_compatible(child,
+					     "qcom,sm8750-dsi-phy-3nm"))
+			continue;
+		if (of_node_check_flag(child, OF_POPULATED))
+			continue;
+		if (count == ARRAY_SIZE(created)) {
+			ret = -E2BIG;
+			goto err_put_child;
+		}
+
+		child_pdev = of_platform_device_create(child, NULL, dev);
+		if (!child_pdev) {
+			ret = -ENODEV;
+			goto err_put_child;
+		}
+		created[count++] = child_pdev;
+	}
+
+	return 0;
+
+err_put_child:
+	of_node_put(child);
+	while (count)
+		of_platform_device_destroy(&created[--count]->dev, NULL);
+	return ret;
+}
+
 static int mdss_probe(struct platform_device *pdev)
 {
 	struct msm_mdss *mdss;
@@ -484,10 +520,24 @@ static int mdss_probe(struct platform_device *pdev)
 	 * level parent: MDSS, and children: MDP5/DPU, DSI, HDMI, eDP etc.
 	 * Populate the children devices, find the MDP5/DPU node, and then add
 	 * the interfaces to our components list.
+	 *
+	 * Runtime-loaded DRM otherwise reaches component bind while the
+	 * single population walk has not created the later DSI PHY supplier.
 	 */
+	if (of_device_is_compatible(dev->of_node, "qcom,sm8750-mdss")) {
+		ret = mdss_prepopulate_dsi_phys(dev);
+		if (ret) {
+			of_platform_depopulate(dev);
+			msm_mdss_destroy(mdss);
+			return dev_err_probe(dev, ret,
+					     "failed to prepopulate DSI PHYs\n");
+		}
+	}
+
 	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
 	if (ret) {
 		DRM_DEV_ERROR(dev, "failed to populate children devices\n");
+		of_platform_depopulate(dev);
 		msm_mdss_destroy(mdss);
 		return ret;
 	}
