@@ -27,6 +27,37 @@ properties:
           - qcom,wcn6750-pmu
           - qcom,wcn6855-pmu
           - qcom,wcn7850-pmu
+          - qcom,wcn7861-pmu
+
+  qcom,qmp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Reference to the AOSS side-channel message RAM
+
+  qcom,pdc-init-table:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description:
+      AOSS QMP commands that configure the WLAN power-domain controller.
+      The commands are sent in order before the PMU supplies are enabled.
+
+  qcom,vreg-pdc-map:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    minItems: 1
+    maxItems: 16
+    items:
+      pattern: '^[a-z0-9]+:(rf|bb)$'
+    description:
+      Unique "regulator:subsystem" entries. Each regulator used by
+      qcom,pmu-vreg-map must have one rf or bb subsystem entry.
+
+  qcom,pmu-vreg-map:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    minItems: 1
+    maxItems: 32
+    items:
+      pattern: '^[A-Z0-9_]+:[a-z0-9]+$'
+    description:
+      Unique "firmware-pin:platform-regulator" entries used to turn
+      target-capability OL-CPR requirements into AOSS PDC voltage votes.
 
   vdd-supply:
     description: VDD supply regulator handle
@@ -182,6 +213,25 @@ allOf:
         - vdddig-supply
         - vddrfa1p2-supply
         - vddrfa1p8-supply
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: qcom,wcn7861-pmu
+    then:
+      required:
+        - qcom,qmp
+        - qcom,pdc-init-table
+        - qcom,vreg-pdc-map
+        - qcom,pmu-vreg-map
+        - vdd-supply
+        - vddio-supply
+        - vddio1p2-supply
+        - vddaon-supply
+        - vdddig-supply
+        - vddrfa1p2-supply
+        - vddrfa1p8-supply
+        - wlan-enable-gpios
 
 additionalProperties: false
 

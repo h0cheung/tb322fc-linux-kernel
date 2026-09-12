@@ -1216,7 +1216,6 @@ static int qca_recv_event(struct hci_dev *hdev, struct sk_buff *skb)
 
 	if (test_bit(QCA_DROP_VENDOR_EVENT, &qca->flags)) {
 		struct hci_event_hdr *hdr = (void *)skb->data;
-
 		/* For the WCN3990 the vendor command for a baudrate change
 		 * isn't sent as synchronous HCI command, because the
 		 * controller sends the corresponding vendor event with the
@@ -1334,6 +1333,8 @@ static uint8_t qca_get_baudrate_value(int speed)
 		return QCA_BAUDRATE_3200000;
 	case 3500000:
 		return QCA_BAUDRATE_3500000;
+	case 8000000:
+		return QCA_BAUDRATE_8000000;
 	default:
 		return QCA_BAUDRATE_115200;
 	}
@@ -1346,7 +1347,7 @@ static int qca_set_baudrate(struct hci_dev *hdev, uint8_t baudrate)
 	struct sk_buff *skb;
 	u8 cmd[] = { 0x01, 0x48, 0xFC, 0x01, 0x00 };
 
-	if (baudrate > QCA_BAUDRATE_3200000)
+	if (baudrate > QCA_BAUDRATE_8000000)
 		return -EINVAL;
 
 	cmd[4] = baudrate;
@@ -1383,6 +1384,7 @@ static int qca_set_baudrate(struct hci_dev *hdev, uint8_t baudrate)
 	case QCA_WCN6750:
 	case QCA_WCN6855:
 	case QCA_WCN7850:
+	case QCA_WCN7861:
 		usleep_range(1000, 10000);
 		break;
 
@@ -1470,6 +1472,7 @@ static int qca_check_speeds(struct hci_uart *hu)
 	case QCA_WCN6750:
 	case QCA_WCN6855:
 	case QCA_WCN7850:
+	case QCA_WCN7861:
 		if (!qca_get_speed(hu, QCA_INIT_SPEED) &&
 		    !qca_get_speed(hu, QCA_OPER_SPEED))
 			return -EINVAL;
@@ -1864,6 +1867,7 @@ static int qca_power_on(struct hci_dev *hdev)
 	case QCA_WCN6750:
 	case QCA_WCN6855:
 	case QCA_WCN7850:
+	case QCA_WCN7861:
 		ret = qca_regulator_init(hu);
 		break;
 
@@ -1906,6 +1910,24 @@ static int qca_configure_hfp_offload(struct hci_dev *hdev)
 	 */
 	hdev->get_codec_config_data = NULL;
 	return 0;
+}
+
+static bool
+qca_wcn7861_uses_current_baudrate(const struct qca_btsoc_version *ver)
+{
+	u32 product_id = le32_to_cpu(ver->product_id);
+	u32 soc_id = le32_to_cpu(ver->soc_id);
+	u16 rom_ver = le16_to_cpu(ver->rom_ver);
+
+	/*
+	 * The Qualcomm Peach HAL deliberately skips SetBaudRateReq for these
+	 * four product/ROM tuples and starts the TLV download at the UART rate
+	 * which was used successfully for the version request.  Sending 0xfc48
+	 * here instead leaves the Elden Peach v2 controller silent.
+	 */
+	return ((soc_id == 0x40210100 && rom_ver == 0x0100) ||
+		(soc_id == 0x40210200 && rom_ver == 0x0200)) &&
+	       (product_id == 0x1e || product_id == 0x21);
 }
 
 static int qca_setup(struct hci_uart *hu)
@@ -1960,6 +1982,7 @@ static int qca_setup(struct hci_uart *hu)
 		break;
 
 	case QCA_WCN7850:
+	case QCA_WCN7861:
 		soc_name = "wcn7850";
 		break;
 
@@ -1986,6 +2009,7 @@ retry:
 	case QCA_WCN6750:
 	case QCA_WCN6855:
 	case QCA_WCN7850:
+	case QCA_WCN7861:
 		if (qcadev && qcadev->bdaddr_property_broken)
 			hci_set_quirk(hdev, HCI_QUIRK_BDADDR_PROPERTY_BROKEN);
 
@@ -2002,12 +2026,24 @@ retry:
 
 	/* Setup user speed if needed */
 	speed = qca_get_speed(hu, QCA_OPER_SPEED);
-	if (speed) {
+	if (speed &&
+	    !(soc_type == QCA_WCN7861 &&
+	      qca_wcn7861_uses_current_baudrate(&ver))) {
 		ret = qca_set_speed(hu, QCA_OPER_SPEED);
 		if (ret)
 			goto out;
 
 		qca_baudrate = qca_get_baudrate_value(speed);
+	} else if (speed) {
+		/*
+		 * Stock still writes the configured operating-rate code into the
+		 * new-format NVM HCI tag.  This value does not change the live UART
+		 * used to download rampatch and NVM.
+		 */
+		qca_baudrate = qca_get_baudrate_value(speed);
+		bt_dev_info(hdev,
+			    "QCA Peach downloads at current UART rate; skipping 0xfc48 (NVM baud 0x%02x)",
+			    qca_baudrate);
 	}
 
 	switch (soc_type) {
@@ -2019,6 +2055,7 @@ retry:
 	case QCA_WCN6750:
 	case QCA_WCN6855:
 	case QCA_WCN7850:
+	case QCA_WCN7861:
 		break;
 
 	default:
@@ -2206,6 +2243,21 @@ static const struct qca_device_data qca_soc_data_wcn6855 __maybe_unused = {
 
 static const struct qca_device_data qca_soc_data_wcn7850 __maybe_unused = {
 	.soc_type = QCA_WCN7850,
+	.vregs = (struct qca_vreg []) {
+		{ "vddio", 5000 },
+		{ "vddaon", 26000 },
+		{ "vdddig", 126000 },
+		{ "vddrfa0p8", 102000 },
+		{ "vddrfa1p2", 257000 },
+		{ "vddrfa1p9", 302000 },
+	},
+	.num_vregs = 6,
+	.capabilities = QCA_CAP_WIDEBAND_SPEECH | QCA_CAP_VALID_LE_STATES |
+			QCA_CAP_HFP_HW_OFFLOAD,
+};
+
+static const struct qca_device_data qca_soc_data_wcn7861 __maybe_unused = {
+	.soc_type = QCA_WCN7861,
 	.vregs = (struct qca_vreg []) {
 		{ "vddio", 5000 },
 		{ "vddaon", 26000 },
@@ -2435,6 +2487,7 @@ static int qca_serdev_probe(struct serdev_device *serdev)
 	case QCA_WCN6750:
 	case QCA_WCN6855:
 	case QCA_WCN7850:
+	case QCA_WCN7861:
 		qcadev->bt_power = devm_kzalloc(&serdev->dev,
 						sizeof(struct qca_power),
 						GFP_KERNEL);
@@ -2454,6 +2507,7 @@ static int qca_serdev_probe(struct serdev_device *serdev)
 	case QCA_WCN6750:
 	case QCA_WCN6855:
 	case QCA_WCN7850:
+	case QCA_WCN7861:
 		if (!device_property_present(&serdev->dev, "enable-gpios")) {
 			/*
 			 * Backward compatibility with old DT sources. If the
@@ -2496,7 +2550,8 @@ static int qca_serdev_probe(struct serdev_device *serdev)
 		if (!qcadev->bt_en &&
 		    (data->soc_type == QCA_WCN6750 ||
 		     data->soc_type == QCA_WCN6855 ||
-		     data->soc_type == QCA_WCN7850))
+		     data->soc_type == QCA_WCN7850 ||
+		     data->soc_type == QCA_WCN7861))
 			power_ctrl_enabled = false;
 
 		qcadev->sw_ctrl = devm_gpiod_get_optional(&serdev->dev, "swctrl",
@@ -2504,7 +2559,8 @@ static int qca_serdev_probe(struct serdev_device *serdev)
 		if (IS_ERR(qcadev->sw_ctrl) &&
 		    (data->soc_type == QCA_WCN6750 ||
 		     data->soc_type == QCA_WCN6855 ||
-		     data->soc_type == QCA_WCN7850)) {
+		     data->soc_type == QCA_WCN7850 ||
+		     data->soc_type == QCA_WCN7861)) {
 			dev_err(&serdev->dev, "failed to acquire SW_CTRL gpio\n");
 			return PTR_ERR(qcadev->sw_ctrl);
 		}
@@ -2589,6 +2645,7 @@ static void qca_serdev_remove(struct serdev_device *serdev)
 	case QCA_WCN6750:
 	case QCA_WCN6855:
 	case QCA_WCN7850:
+	case QCA_WCN7861:
 		if (power->vregs_on)
 			qca_power_off(&qcadev->serdev_hu);
 		break;
@@ -2791,6 +2848,7 @@ static const struct of_device_id qca_bluetooth_of_match[] = {
 	{ .compatible = "qcom,wcn6750-bt", .data = &qca_soc_data_wcn6750},
 	{ .compatible = "qcom,wcn6855-bt", .data = &qca_soc_data_wcn6855},
 	{ .compatible = "qcom,wcn7850-bt", .data = &qca_soc_data_wcn7850},
+	{ .compatible = "qcom,wcn7861-bt", .data = &qca_soc_data_wcn7861},
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, qca_bluetooth_of_match);

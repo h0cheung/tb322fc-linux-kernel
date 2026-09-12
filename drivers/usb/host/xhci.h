@@ -129,7 +129,7 @@ struct xhci_op_regs {
  * PCI config regs).  HC does NOT drive a USB reset on the downstream ports.
  * The xHCI driver must reinitialize the xHC after setting this bit.
  */
-#define CMD_RESET	BIT(1)
+#define CMD_RESET	XHCI_CMD_RESET
 /* Event Interrupt Enable - a '1' allows interrupts from the host controller */
 #define CMD_EIE		XHCI_CMD_EIE
 /* Host System Error Interrupt Enable - get out-of-band signal for HC errors */

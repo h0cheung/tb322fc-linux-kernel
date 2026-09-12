@@ -14,9 +14,18 @@ description:
   Qualcomm Technologies IEEE 802.11be PCIe devices.
 
 properties:
+  qcom,msi-iova:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      Fixed device-visible address required by firmware for the MSI doorbell.
+      Must be nonzero and aligned to the IOMMU page size. The operating system
+      reserves this address in the device's DMA domain before mapping the
+      interrupt controller's doorbell page.
+
   compatible:
     enum:
       - pci17cb,1107  # WCN7850
+      - pci17cb,110e  # Peach v2
 
   reg:
     maxItems: 1

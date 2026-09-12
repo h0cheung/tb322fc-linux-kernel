@@ -1191,7 +1191,7 @@ static int audioreach_shmem_set_media_format(struct q6apm_graph *graph,
 	if (mcfg->fmt == SND_AUDIOCODEC_PCM) {
 		header->data_format = DATA_FORMAT_FIXED_POINT;
 		header->fmt_id =  MEDIA_FMT_ID_PCM;
-		header->payload_size = payload_size - sizeof(*header);
+		header->payload_size = struct_size(cfg, channel_mapping, num_channels);
 
 		p = p + sizeof(*header);
 		cfg = p;

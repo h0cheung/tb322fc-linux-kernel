@@ -8,6 +8,7 @@
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
 #include <linux/iopoll.h>
+#include <linux/of.h>
 
 #include "dsi_phy.h"
 #include "dsi.xml.h"
@@ -349,6 +350,8 @@ static int dsi_pll_7nm_vco_set_rate(struct clk_hw *hw, unsigned long rate,
 {
 	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(hw);
 	struct dsi_pll_config config;
+	void __iomem *base = pll_7nm->phy->pll_base;
+	u32 decimal, fraction;
 
 	dsi_pll_enable_pll_bias(pll_7nm);
 	DBG("DSI PLL%d rate=%lu, parent's=%lu", pll_7nm->phy->id, rate,
@@ -362,12 +365,29 @@ static int dsi_pll_7nm_vco_set_rate(struct clk_hw *hw, unsigned long rate,
 
 	dsi_pll_calc_ssc(pll_7nm, &config);
 
+	/* Repeated ideal-rate requests can encode the running rate. */
+	if (of_device_is_compatible(pll_7nm->phy->pdev->dev.of_node,
+				    "qcom,sm8750-dsi-phy-3nm") &&
+	    READ_ONCE(pll_7nm->phy->pll_on)) {
+		decimal = readl(base + REG_DSI_7nm_PHY_PLL_DECIMAL_DIV_START_1) & 0xff;
+		fraction = readl(base + REG_DSI_7nm_PHY_PLL_FRAC_DIV_START_LOW_1) & 0xff;
+		fraction |= (readl(base + REG_DSI_7nm_PHY_PLL_FRAC_DIV_START_MID_1) &
+			     0xff) << 8;
+		fraction |= (readl(base + REG_DSI_7nm_PHY_PLL_FRAC_DIV_START_HIGH_1) &
+			     0x3) << 16;
+		if (decimal == config.decimal_div_start &&
+		    fraction == config.frac_div_start) {
+			goto out_bias;
+		}
+	}
+
 	dsi_pll_commit(pll_7nm, &config);
 
 	dsi_pll_config_hzindep_reg(pll_7nm);
 
 	dsi_pll_ssc_commit(pll_7nm, &config);
 
+out_bias:
 	dsi_pll_disable_pll_bias(pll_7nm);
 	/* flush, ensure all register writes are done*/
 	wmb();
@@ -535,7 +555,14 @@ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 	if (pll_7nm->slave)
 		writel(0x1, pll_7nm->slave->phy->base + REG_DSI_7nm_PHY_CMN_RBUF_CTRL);
 
+	return 0;
+
 error:
+	writel(0, pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
+	dsi_pll_disable_pll_bias(pll_7nm);
+	if (pll_7nm->slave)
+		dsi_pll_disable_pll_bias(pll_7nm->slave);
+	wmb(); /* Complete failed startup cleanup before returning. */
 	return rc;
 }
 
@@ -814,10 +841,24 @@ static int pll_7nm_register(struct dsi_pll_7nm *pll_7nm, struct clk_hw **provide
 	 * don't register a pclk_mux clock and just use post_out_div instead
 	 */
 	if (pll_7nm->phy->cphy_mode) {
-		dsi_pll_cmn_clk_cfg1_update(pll_7nm,
-					    DSI_7nm_PHY_CMN_CLK_CFG1_DSICLK_SEL__MASK,
-					    DSI_7nm_PHY_CMN_CLK_CFG1_DSICLK_SEL(3));
-		phy_pll_out_dsi_parent = pll_post_out_div;
+		/*
+		 * The elden 30-bpp / three-trio C-PHY uses the full-rate bit
+		 * path (DSICLK_SEL=0), followed by PIX_CLK_DIV=2 and the DISPCC
+		 * 16/35 M/N ratio. The generic 2/7 path cannot synthesize its
+		 * 172.992 MHz compressed per-host pixel clock.
+		 */
+		if (of_device_is_compatible(pll_7nm->phy->pdev->dev.of_node,
+					    "qcom,sm8750-dsi-phy-3nm")) {
+			dsi_pll_cmn_clk_cfg1_update(pll_7nm,
+						    DSI_7nm_PHY_CMN_CLK_CFG1_DSICLK_SEL__MASK,
+				DSI_7nm_PHY_CMN_CLK_CFG1_DSICLK_SEL(0));
+			phy_pll_out_dsi_parent = pll_bit;
+		} else {
+			dsi_pll_cmn_clk_cfg1_update(pll_7nm,
+						    DSI_7nm_PHY_CMN_CLK_CFG1_DSICLK_SEL__MASK,
+				DSI_7nm_PHY_CMN_CLK_CFG1_DSICLK_SEL(3));
+			phy_pll_out_dsi_parent = pll_post_out_div;
+		}
 	} else {
 		snprintf(clk_name, sizeof(clk_name), "dsi%d_pclk_mux", pll_7nm->phy->id);
 
@@ -1029,9 +1070,16 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
 
 	if ((phy->cfg->quirks & DSI_PHY_7NM_QUIRK_V7_2)) {
 		if (phy->cphy_mode) {
-			/* TODO: different for second phy */
-			vreg_ctrl_0 = 0x57;
-			vreg_ctrl_1 = 0x41;
+			/* SM8750 v7.2 uses lower slave-PHY LDO values when PLL0
+			 * supplies the bonded link clocks.
+			 */
+			if (phy->id) {
+				vreg_ctrl_0 = 0x44;
+				vreg_ctrl_1 = 0x42;
+			} else {
+				vreg_ctrl_0 = 0x57;
+				vreg_ctrl_1 = 0x41;
+			}
 			glbl_rescode_top_ctrl = 0x3d;
 			glbl_rescode_bot_ctrl = 0x38;
 		} else {
@@ -1154,17 +1202,33 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
 
 	/* DSI PHY timings */
 	if (phy->cphy_mode) {
-		writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0);
-		writel(timing->hs_exit, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_4);
-		writel(timing->shared_timings.clk_pre,
-		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_5);
-		writel(timing->clk_prepare, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_6);
-		writel(timing->shared_timings.clk_post,
-		       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_7);
-		writel(timing->hs_rqst, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_8);
-		writel(0x02, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_9);
-		writel(0x04, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_10);
-		writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_11);
+		if (phy->has_cphy_timing_ctrl) {
+			unsigned int i;
+
+			for (i = 0; i < ARRAY_SIZE(phy->cphy_timing_ctrl); i++)
+				writel(phy->cphy_timing_ctrl[i],
+				       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0 + i * 4);
+		} else {
+			/* C-PHY does not use these D-PHY-only registers. Clear
+			 * bootloader values so they cannot leak into a later enable.
+			 */
+			writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0);
+			writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_1);
+			writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_2);
+			writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_3);
+			writel(timing->hs_exit, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_4);
+			writel(timing->shared_timings.clk_pre,
+			       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_5);
+			writel(timing->clk_prepare, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_6);
+			writel(timing->shared_timings.clk_post,
+			       base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_7);
+			writel(timing->hs_rqst, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_8);
+			writel(0x02, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_9);
+			writel(0x04, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_10);
+			writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_11);
+			writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_12);
+			writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_13);
+		}
 	} else {
 		writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0);
 		writel(timing->clk_zero, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_1);

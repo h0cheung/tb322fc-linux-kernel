@@ -62,6 +62,9 @@ properties:
     minItems: 8
     maxItems: 9
 
+  vdda-supply:
+    description: Core analog power supply
+
   interrupt-names:
     minItems: 8
     items:

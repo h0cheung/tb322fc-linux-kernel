@@ -30,6 +30,7 @@
 #include "msm_dsc_helper.h"
 #include "msm_kms.h"
 #include "msm_gem.h"
+#include "msm_mmu.h"
 #include "phy/dsi_phy.h"
 
 #define DSI_RESET_TOGGLE_DELAY_MS 20
@@ -127,11 +128,18 @@ struct msm_dsi_host {
 	struct clk *pixel_src_clk;
 	struct clk *dsi_pll_byte_clk;
 	struct clk *dsi_pll_pixel_clk;
+	struct clk *byte_src_parent;
+	struct clk *pixel_src_parent;
 
 	unsigned long byte_clk_rate;
 	bool byte_intf_clk_div_2;
+	unsigned long byte_intf_clk_rate;
 	unsigned long pixel_clk_rate;
 	unsigned long esc_clk_rate;
+	unsigned long link_byte_rate;
+	unsigned long link_pixel_rate;
+	unsigned long link_intf_rate;
+	bool link_configured;
 
 	/* DSI v2 specific clocks */
 	struct clk *src_clk;
@@ -153,6 +161,7 @@ struct msm_dsi_host {
 	/* DSI 6G TX buffer*/
 	struct drm_gem_object *tx_gem_obj;
 	struct drm_gpuvm *vm;
+	u64 tx_buf_iova;
 
 	/* DSI v2 TX buffer */
 	void *tx_buf;
@@ -166,6 +175,7 @@ struct msm_dsi_host {
 
 	struct drm_display_mode *mode;
 	struct drm_dsc_config *dsc;
+	unsigned int dsc_slice_per_pkt;
 
 	/* connected device info */
 	unsigned int channel;
@@ -181,10 +191,16 @@ struct msm_dsi_host {
 	bool cphy_mode;
 
 	u32 dma_cmd_ctrl_restore;
+	u32 cmd_dma_ctrl_restore;
+	u32 cmd_dma_ctrl1_restore;
+	u32 intr_mask_restore;
 
 	bool registered;
 	bool power_on;
 	bool enabled;
+	bool bonded_polling;
+	u32 dma_submit_seq;
+	u32 dma_done_seq;
 	int irq;
 };
 
@@ -345,7 +361,9 @@ static int dsi_clk_init(struct msm_dsi_host *msm_host)
 				     "%s: can't find dsi_esc clock\n",
 				     __func__);
 
-	if (cfg_hnd->ops->clk_init_ver)
+	if (of_device_is_compatible(pdev->dev.of_node, "qcom,sm8750-dsi-ctrl"))
+		ret = dsi_clk_init_6g_v2_9(msm_host);
+	else if (cfg_hnd->ops->clk_init_ver)
 		ret = cfg_hnd->ops->clk_init_ver(msm_host);
 
 	return ret;
@@ -361,6 +379,7 @@ int msm_dsi_runtime_suspend(struct device *dev)
 	if (!msm_host->cfg_hnd)
 		return 0;
 
+	WRITE_ONCE(msm_host->link_configured, false);
 	clk_bulk_disable_unprepare(msm_host->num_bus_clks, msm_host->bus_clks);
 
 	return 0;
@@ -381,6 +400,7 @@ int msm_dsi_runtime_resume(struct device *dev)
 
 int dsi_link_clk_set_rate_6g(struct msm_dsi_host *msm_host)
 {
+	struct device *dev = &msm_host->pdev->dev;
 	unsigned long byte_intf_clk_rate;
 	long rounded_byte_clk_rate;
 	int ret;
@@ -398,7 +418,7 @@ int dsi_link_clk_set_rate_6g(struct msm_dsi_host *msm_host)
 	DBG("Set clk rates: pclk=%lu, byteclk=%lu",
 	    msm_host->pixel_clk_rate, msm_host->byte_clk_rate);
 
-	ret = dev_pm_opp_set_rate(&msm_host->pdev->dev,
+	ret = dev_pm_opp_set_rate(dev,
 				  msm_host->byte_clk_rate);
 	if (ret) {
 		pr_err("%s: dev_pm_opp_set_rate failed %d\n", __func__, ret);
@@ -432,17 +452,37 @@ int dsi_link_clk_set_rate_6g_v2_9(struct msm_dsi_host *msm_host)
 	struct device *dev = &msm_host->pdev->dev;
 	int ret;
 
+	if (!msm_host->byte_src_parent)
+		msm_host->byte_src_parent = clk_get_parent(msm_host->byte_src_clk);
+	if (!msm_host->pixel_src_parent)
+		msm_host->pixel_src_parent = clk_get_parent(msm_host->pixel_src_clk);
+
 	/*
 	 * DSI PHY PLLs have to be enabled to allow reparenting to them, so
-	 * cannot use assigned-clock-parents.
+	 * cannot use assigned-clock-parents. SM8750's C-PHY parent-enable path
+	 * also needs a valid cached VCO rate before the first prepare attempt.
 	 */
+	if (of_device_is_compatible(dev->of_node, "qcom,sm8750-dsi-ctrl")) {
+		ret = clk_set_rate(msm_host->dsi_pll_byte_clk,
+				   msm_host->byte_clk_rate);
+		if (ret) {
+			dev_err(dev, "Failed to set DSI PLL byte rate %lu: %d\n",
+				msm_host->byte_clk_rate, ret);
+			return ret;
+		}
+	}
+
 	ret = clk_set_parent(msm_host->byte_src_clk, msm_host->dsi_pll_byte_clk);
-	if (ret)
+	if (ret) {
 		dev_err(dev, "Failed to parent byte_src -> dsi_pll_byte: %d\n", ret);
+		return ret;
+	}
 
 	ret = clk_set_parent(msm_host->pixel_src_clk, msm_host->dsi_pll_pixel_clk);
-	if (ret)
+	if (ret) {
 		dev_err(dev, "Failed to parent pixel_src -> dsi_pll_pixel: %d\n", ret);
+		return ret;
+	}
 
 	return dsi_link_clk_set_rate_6g(msm_host);
 }
@@ -754,7 +794,45 @@ static void dsi_intr_ctrl(struct msm_dsi_host *msm_host, u32 mask, int enable)
 
 	DBG("intr=%x enable=%d", intr, enable);
 
+	if (READ_ONCE(msm_host->bonded_polling))
+		intr &= ~DSI_IRQ_CMD_DMA_DONE;
 	dsi_write(msm_host, REG_DSI_INTR_CTRL, intr);
+	spin_unlock_irqrestore(&msm_host->intr_lock, flags);
+}
+
+#define DSI_IRQ_ALL_MASKS \
+	(DSI_IRQ_MASK_CMD_DMA_DONE | DSI_IRQ_MASK_CMD_MDP_DONE | \
+	 DSI_IRQ_MASK_VIDEO_DONE | DSI_IRQ_MASK_BTA_DONE | DSI_IRQ_MASK_ERROR)
+
+/*
+ * REG_DSI_INTR_CTRL mixes W1C status bits with interrupt-mask bits.  The
+ * downstream-aligned bonded path must never write back unrelated status bits
+ * while changing CMD_DMA_DONE masking.
+ */
+static void dsi_cmd_dma_intr_update(struct msm_dsi_host *msm_host,
+				    bool enable, bool clear)
+{
+	u32 intr;
+	unsigned long flags;
+
+	spin_lock_irqsave(&msm_host->intr_lock, flags);
+	intr = dsi_read(msm_host, REG_DSI_INTR_CTRL) & DSI_IRQ_ALL_MASKS;
+	if (enable)
+		intr |= DSI_IRQ_MASK_CMD_DMA_DONE;
+	else
+		intr &= ~DSI_IRQ_MASK_CMD_DMA_DONE;
+	if (clear)
+		intr |= DSI_IRQ_CMD_DMA_DONE | DSI_IRQ_BTA_DONE;
+	dsi_write(msm_host, REG_DSI_INTR_CTRL, intr);
+	spin_unlock_irqrestore(&msm_host->intr_lock, flags);
+}
+
+static void dsi_intr_masks_restore(struct msm_dsi_host *msm_host, u32 masks)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&msm_host->intr_lock, flags);
+	dsi_write(msm_host, REG_DSI_INTR_CTRL, masks & DSI_IRQ_ALL_MASKS);
 	spin_unlock_irqrestore(&msm_host->intr_lock, flags);
 }
 
@@ -889,8 +967,11 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 		data |= DSI_TRIG_CTRL_BLOCK_DMA_WITHIN_FRAME;
 	dsi_write(msm_host, REG_DSI_TRIG_CTRL, data);
 
-	data = DSI_CLKOUT_TIMING_CTRL_T_CLK_POST(phy_shared_timings->clk_post) |
-		DSI_CLKOUT_TIMING_CTRL_T_CLK_PRE(phy_shared_timings->clk_pre);
+	/* C-PHY embeds the clock in its trios and has no D-PHY clock lane. */
+	data = 0;
+	if (!msm_host->cphy_mode)
+		data = DSI_CLKOUT_TIMING_CTRL_T_CLK_POST(phy_shared_timings->clk_post) |
+			DSI_CLKOUT_TIMING_CTRL_T_CLK_PRE(phy_shared_timings->clk_pre);
 	dsi_write(msm_host, REG_DSI_CLKOUT_TIMING_CTRL, data);
 
 	if ((cfg_hnd->major == MSM_DSI_VER_MAJOR_6G) &&
@@ -952,17 +1033,10 @@ static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mod
 	slice_per_intf = dsc->slice_count;
 
 	total_bytes_per_intf = dsc->slice_chunk_size * slice_per_intf;
-	bytes_per_pkt = dsc->slice_chunk_size; /* * slice_per_pkt; */
+	bytes_per_pkt = dsc->slice_chunk_size * msm_host->dsc_slice_per_pkt;
 
 	eol_byte_num = total_bytes_per_intf % 3;
-
-	/*
-	 * Typically, pkt_per_line = slice_per_intf * slice_per_pkt.
-	 *
-	 * Since the current driver only supports slice_per_pkt = 1,
-	 * pkt_per_line will be equal to slice per intf for now.
-	 */
-	pkt_per_line = slice_per_intf;
+	pkt_per_line = slice_per_intf / msm_host->dsc_slice_per_pkt;
 
 	if (is_cmd_mode) /* packet data type */
 		reg = DSI_COMMAND_COMPRESSION_MODE_CTRL_STREAM0_DATATYPE(MIPI_DSI_DCS_LONG_WRITE);
@@ -1118,12 +1192,8 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 		else
 			/*
 			 * When DSC is enabled, WC = slice_chunk_size * slice_per_pkt + 1.
-			 * Currently, the driver only supports default value of slice_per_pkt = 1
-			 *
-			 * TODO: Expand mipi_dsi_device struct to hold slice_per_pkt info
-			 *       and adjust DSC math to account for slice_per_pkt.
 			 */
-			wc = msm_host->dsc->slice_chunk_size + 1;
+			wc = msm_host->dsc->slice_chunk_size * msm_host->dsc_slice_per_pkt + 1;
 
 		dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL,
 			DSI_CMD_MDP_STREAM0_CTRL_WORD_COUNT(wc) |
@@ -1138,9 +1208,41 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 	}
 }
 
+static void dsi_sw_reset_v2_9(struct msm_dsi_host *msm_host)
+{
+	u32 ctrl = dsi_read(msm_host, REG_DSI_CTRL);
+	u32 clocks;
+	u32 force_on = DSI_CLK_CTRL_ENABLE_CLKS | BIT(8) | BIT(9) |
+		       BIT(11) | BIT(21);
+
+	/* Match the SM8750 stock controller reset, including dynamic clocks. */
+	dsi_write(msm_host, REG_DSI_CTRL,
+		  ctrl & ~(DSI_CTRL_ENABLE | DSI_CTRL_VID_MODE_EN |
+			   DSI_CTRL_CMD_MODE_EN));
+	wmb(); /* disable all engines before forcing clocks */
+
+	clocks = dsi_read(msm_host, REG_DSI_CLK_CTRL);
+	dsi_write(msm_host, REG_DSI_CLK_CTRL, clocks | force_on);
+	wmb(); /* clocks must run while reset is asserted */
+	dsi_write(msm_host, REG_DSI_RESET, 1);
+	wmb(); /* assert reset before starting the pulse delay */
+	udelay(1);
+	dsi_write(msm_host, REG_DSI_RESET, 0);
+	wmb(); /* release reset before restoring clock gating */
+	dsi_write(msm_host, REG_DSI_CLK_CTRL, clocks);
+	wmb(); /* restore clocks before enabling the controller */
+	dsi_write(msm_host, REG_DSI_CTRL, ctrl);
+	wmb(); /* finish restoring the controller */
+}
+
 static void dsi_sw_reset(struct msm_dsi_host *msm_host)
 {
 	u32 ctrl;
+
+	if (of_device_is_compatible(msm_host->pdev->dev.of_node, "qcom,sm8750-dsi-ctrl")) {
+		dsi_sw_reset_v2_9(msm_host);
+		return;
+	}
 
 	ctrl = dsi_read(msm_host, REG_DSI_CTRL);
 
@@ -1268,6 +1370,7 @@ int dsi_tx_buf_alloc_6g(struct msm_dsi_host *msm_host, int size)
 	}
 
 	msm_gem_object_set_name(msm_host->tx_gem_obj, "tx_gem");
+	msm_host->tx_buf_iova = iova;
 
 	msm_host->tx_size = msm_host->tx_gem_obj->size;
 
@@ -1307,6 +1410,7 @@ void msm_dsi_tx_buf_free(struct mipi_dsi_host *host)
 		drm_gpuvm_put(msm_host->vm);
 		msm_host->tx_gem_obj = NULL;
 		msm_host->vm = NULL;
+		msm_host->tx_buf_iova = 0;
 	}
 
 	if (msm_host->tx_buf)
@@ -1454,7 +1558,7 @@ static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
 	int ret;
 	uint64_t dma_base;
-	bool triggered;
+	int triggered;
 
 	ret = cfg_hnd->ops->dma_base_get(msm_host, &dma_base);
 	if (ret) {
@@ -1468,7 +1572,9 @@ static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
 
 	triggered = msm_dsi_manager_cmd_xfer_trigger(
 						msm_host->id, dma_base, len);
-	if (triggered) {
+	if (triggered < 0) {
+		ret = triggered;
+	} else if (triggered) {
 		ret = wait_for_completion_timeout(&msm_host->dma_comp,
 					msecs_to_jiffies(200));
 		DBG("ret=%d", ret);
@@ -1582,6 +1688,9 @@ static void dsi_err_worker(struct work_struct *work)
 		container_of(work, struct msm_dsi_host, err_work);
 	u32 status = msm_host->err_work_state;
 
+	if (msm_dsi_manager_cmd_failed())
+		return;
+
 	pr_err_ratelimited("%s: status=%x\n", __func__, status);
 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
 		dsi_sw_reset(msm_host);
@@ -1694,15 +1803,26 @@ static void dsi_error(struct msm_dsi_host *msm_host)
 static irqreturn_t dsi_host_irq(int irq, void *ptr)
 {
 	struct msm_dsi_host *msm_host = ptr;
-	u32 isr;
+	u32 ack, isr, raw, submit_seq = 0;
 	unsigned long flags;
 
 	if (!msm_host->ctrl_base)
 		return IRQ_HANDLED;
 
 	spin_lock_irqsave(&msm_host->intr_lock, flags);
-	isr = dsi_read(msm_host, REG_DSI_INTR_CTRL);
-	dsi_write(msm_host, REG_DSI_INTR_CTRL, isr);
+	raw = dsi_read(msm_host, REG_DSI_INTR_CTRL);
+	isr = raw;
+	ack = raw;
+	if (READ_ONCE(msm_host->bonded_polling) &&
+	    !(isr & DSI_IRQ_MASK_CMD_DMA_DONE)) {
+		isr &= ~DSI_IRQ_CMD_DMA_DONE;
+		ack &= ~DSI_IRQ_CMD_DMA_DONE;
+	}
+	if (isr & DSI_IRQ_CMD_DMA_DONE) {
+		submit_seq = READ_ONCE(msm_host->dma_submit_seq);
+		WRITE_ONCE(msm_host->dma_done_seq, submit_seq);
+	}
+	dsi_write(msm_host, REG_DSI_INTR_CTRL, ack);
 	spin_unlock_irqrestore(&msm_host->intr_lock, flags);
 
 	DBG("isr=0x%x, id=%d", isr, msm_host->id);
@@ -1732,8 +1852,13 @@ static int dsi_host_attach(struct mipi_dsi_host *host,
 	msm_host->lanes = dsi->lanes;
 	msm_host->format = dsi->format;
 	msm_host->mode_flags = dsi->mode_flags;
-	if (dsi->dsc)
+	if (dsi->dsc) {
 		msm_host->dsc = dsi->dsc;
+		if (dsi->mode_flags & MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT)
+			msm_host->dsc_slice_per_pkt = dsi->dsc->slice_count;
+		else
+			msm_host->dsc_slice_per_pkt = 1;
+	}
 
 	if (msm_host->format == MIPI_DSI_FMT_RGB101010) {
 		if (!msm_dsi_host_version_geq(msm_host, MSM_DSI_VER_MAJOR_6G,
@@ -1880,8 +2005,36 @@ static int dsi_host_parse_lane_data(struct msm_dsi_host *msm_host,
 	return -EINVAL;
 }
 
+static u8 dsi_dsc_1_2_first_line_bpg_offset(const struct drm_dsc_config *dsc)
+{
+	u8 bpg_offset;
+	u8 uncompressed_bpg_rate;
+	u8 bpp = drm_dsc_get_bpp_int(dsc);
+
+	if (dsc->slice_height < 8)
+		bpg_offset = 2 * (dsc->slice_height - 1);
+	else if (dsc->slice_height < 20)
+		bpg_offset = 12;
+	else if (dsc->slice_height <= 30)
+		bpg_offset = 13;
+	else if (dsc->slice_height < 42)
+		bpg_offset = 14;
+	else
+		bpg_offset = 15;
+
+	if (dsc->native_422)
+		uncompressed_bpg_rate = 3 * bpp * 4;
+	else if (dsc->native_420)
+		uncompressed_bpg_rate = 3 * bpp;
+	else
+		uncompressed_bpg_rate = (3 * bpp + 2) * 3;
+
+	return min_t(u8, bpg_offset, uncompressed_bpg_rate - 3 * bpp);
+}
+
 static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc_config *dsc)
 {
+	enum drm_dsc_params_type params_type = DRM_DSC_1_1_PRE_SCR;
 	int ret;
 
 	if (dsc->bits_per_pixel & 0xf) {
@@ -1913,12 +2066,24 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
 	drm_dsc_set_const_params(dsc);
 	drm_dsc_set_rc_buf_thresh(dsc);
 
-	/* DPU supports only pre-SCR panels */
-	ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_1_PRE_SCR);
+	if (dsc->dsc_version_minor == 2) {
+		if (dsc->native_422)
+			params_type = DRM_DSC_1_2_422;
+		else if (dsc->native_420)
+			params_type = DRM_DSC_1_2_420;
+		else
+			params_type = DRM_DSC_1_2_444;
+	}
+
+	ret = drm_dsc_setup_rc_params(dsc, params_type);
 	if (ret) {
 		DRM_DEV_ERROR(&msm_host->pdev->dev, "could not find DSC RC parameters\n");
 		return ret;
 	}
+
+	if (dsc->dsc_version_minor == 2)
+		dsc->first_line_bpg_offset =
+			dsi_dsc_1_2_first_line_bpg_offset(dsc);
 
 	dsc->initial_scale_value = drm_dsc_initial_scale_value(dsc);
 	dsc->line_buf_depth = dsc->bits_per_component + 1;
@@ -2167,11 +2332,324 @@ void msm_dsi_host_unregister(struct mipi_dsi_host *host)
 	}
 }
 
+void msm_dsi_host_bonded_wait_video(struct mipi_dsi_host *host)
+{
+	dsi_wait4video_eng_busy(to_msm_dsi_host(host));
+}
+
+static void dsi_cmd_error_prepare(struct msm_dsi_host *msm_host)
+{
+	u32 val;
+
+	val = dsi_read(msm_host, REG_DSI_ERR_INT_MASK0);
+	val |= 0x001f0200;
+	dsi_write(msm_host, REG_DSI_ERR_INT_MASK0, val);
+	wmb(); /* Stock completes the error-mask write before stale clear. */
+
+	/* Stock clear_error_status(0x20): LP RX timeout status bit 4. */
+	dsi_write(msm_host, REG_DSI_TIMEOUT_STATUS, BIT(4));
+}
+
+static void dsi_cmd_error_cleanup(struct msm_dsi_host *msm_host)
+{
+	u32 val;
+
+	/* Stock mask_error_intr(0x2, false) W1C-clears FIFO errors. */
+	val = dsi_read(msm_host, REG_DSI_FIFO_STATUS);
+	dsi_write(msm_host, REG_DSI_FIFO_STATUS, val | 0x44440400);
+	val = dsi_read(msm_host, REG_DSI_ERR_INT_MASK0);
+	val &= ~0x001f0200;
+	dsi_write(msm_host, REG_DSI_ERR_INT_MASK0, val);
+	wmb(); /* Complete overflow unmask before stale-error clear. */
+
+	/* Stock repeats clear_error_status(0x20) after command-engine off. */
+	dsi_write(msm_host, REG_DSI_TIMEOUT_STATUS, BIT(4));
+}
+
+static int dsi_cmd_link_clk_set_rate(struct msm_dsi_host *msm_host)
+{
+	struct device *dev = &msm_host->pdev->dev;
+
+	if (of_device_is_compatible(msm_host->pdev->dev.of_node, "qcom,sm8750-dsi-ctrl")) {
+		/*
+		 * Power-on owns the link clocks and their OPP vote. Commands
+		 * only acquire another enable reference: reapplying an ideal
+		 * rate can rewrite a running PLL after fractional truncation.
+		 * Reject stale configuration instead of repairing it live.
+		 */
+		if (!READ_ONCE(msm_host->power_on) ||
+		    !READ_ONCE(msm_host->link_configured) ||
+		    msm_host->byte_clk_rate != msm_host->link_byte_rate ||
+		    msm_host->pixel_clk_rate != msm_host->link_pixel_rate ||
+		    msm_host->byte_intf_clk_rate != msm_host->link_intf_rate ||
+		    !clk_is_match(clk_get_parent(msm_host->byte_src_clk),
+				  msm_host->dsi_pll_byte_clk) ||
+		    !clk_is_match(clk_get_parent(msm_host->pixel_src_clk),
+				  msm_host->dsi_pll_pixel_clk)) {
+			dev_err(dev, "stale link configuration\n");
+			return -ESTALE;
+		}
+
+		return 0;
+	}
+
+	if (of_device_is_compatible(dev->of_node, "qcom,sm8750-dsi-ctrl"))
+		return dsi_link_clk_set_rate_6g_v2_9(msm_host);
+
+	return msm_host->cfg_hnd->ops->link_clk_set_rate(msm_host);
+}
+
+int msm_dsi_host_bonded_xfer_prepare(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
+	int ret;
+
+	ret = pm_runtime_resume_and_get(&msm_host->pdev->dev);
+	if (ret < 0)
+		return ret;
+
+	ret = dsi_cmd_link_clk_set_rate(msm_host);
+	if (ret)
+		goto err_runtime_put;
+
+	ret = cfg_hnd->ops->link_clk_enable(msm_host);
+	if (ret)
+		goto err_runtime_put;
+
+	msm_host->dma_cmd_ctrl_restore = dsi_read(msm_host, REG_DSI_CTRL);
+	msm_host->cmd_dma_ctrl_restore =
+		dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL);
+	msm_host->cmd_dma_ctrl1_restore =
+		dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL1);
+	msm_host->intr_mask_restore =
+		dsi_read(msm_host, REG_DSI_INTR_CTRL) & DSI_IRQ_ALL_MASKS;
+	dsi_cmd_error_prepare(msm_host);
+	dsi_write(msm_host, REG_DSI_CTRL,
+		  msm_host->dma_cmd_ctrl_restore |
+		  DSI_CTRL_CMD_MODE_EN | DSI_CTRL_ENABLE);
+
+	/* The slave is polled, never completed through its Linux IRQ. */
+	dsi_cmd_dma_intr_update(msm_host, false, true);
+	return 0;
+
+err_runtime_put:
+	pm_runtime_put_sync(&msm_host->pdev->dev);
+	return ret;
+}
+
+void msm_dsi_host_bonded_xfer_restore(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
+
+	WRITE_ONCE(msm_host->bonded_polling, false);
+	dsi_cmd_dma_intr_update(msm_host, false, false);
+	dsi_write(msm_host, REG_DSI_CMD_DMA_CTRL1,
+		  msm_host->cmd_dma_ctrl1_restore);
+	dsi_write(msm_host, REG_DSI_CMD_DMA_CTRL,
+		  msm_host->cmd_dma_ctrl_restore);
+	dsi_write(msm_host, REG_DSI_CTRL, msm_host->dma_cmd_ctrl_restore);
+	dsi_write(msm_host, REG_DSI_DMA_SCHEDULE_CTRL2, 0);
+	dsi_write(msm_host, REG_DSI_DMA_SCHEDULE_CTRL, 0);
+	dsi_cmd_error_cleanup(msm_host);
+	dsi_intr_masks_restore(msm_host, msm_host->intr_mask_restore);
+	cfg_hnd->ops->link_clk_disable(msm_host);
+	pm_runtime_put_sync(&msm_host->pdev->dev);
+}
+
+int msm_dsi_host_bonded_cmd_build(struct mipi_dsi_host *host,
+				  const struct mipi_dsi_msg *msg,
+				  u32 *dma_base, u32 *len)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
+	u64 base;
+	int packet_len;
+	int bllp_len;
+	int ret;
+
+	if (msm_host->tx_gem_obj)
+		msm_gem_sync_for_cpu(msm_host->tx_gem_obj);
+	packet_len = dsi_cmd_dma_add(msm_host, msg);
+	if (msm_host->tx_gem_obj)
+		msm_gem_sync_for_device(msm_host->tx_gem_obj);
+	if (packet_len < 0)
+		return packet_len;
+
+	bllp_len = msm_host->mode->hdisplay *
+		mipi_dsi_pixel_format_to_bpp(msm_host->format) / 8;
+	if ((msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) &&
+	    packet_len > bllp_len)
+		return -EINVAL;
+
+	if (msm_host->tx_gem_obj) {
+		base = msm_host->tx_buf_iova;
+	} else {
+		ret = cfg_hnd->ops->dma_base_get(msm_host, &base);
+		if (ret)
+			return ret;
+	}
+	if (upper_32_bits(base))
+		return -ERANGE;
+
+	*dma_base = lower_32_bits(base);
+	*len = packet_len;
+	return 0;
+}
+
+void msm_dsi_host_bonded_cmd_init_trigger(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	u32 schedule_line;
+	u32 val;
+
+	/*
+	 * Lenovo's v2.9 path initializes command-DMA trigger state for every
+	 * command. Clear mainline's non-stock within-frame gate as well as stale
+	 * scheduling mux/select state before either bonded descriptor is staged.
+	 */
+	val = dsi_read(msm_host, REG_DSI_TRIG_CTRL);
+	val &= ~GENMASK(3, 0);
+	val &= ~DSI_TRIG_CTRL_BLOCK_DMA_WITHIN_FRAME;
+	val &= ~DSI_TRIG_CTRL_DMA_TRG_MUX;
+	val &= ~DSI_TRIG_CTRL_DMA_TRIGGER_EXT__MASK;
+	val |= DSI_TRIG_CTRL_DMA_TRIGGER(TRIGGER_SW);
+	dsi_write(msm_host, REG_DSI_TRIG_CTRL, val);
+
+	/* Reset bootloader/prior-command scheduling state before this command. */
+	dsi_write(msm_host, REG_DSI_DMA_SCHEDULE_CTRL2, 0);
+	dsi_write(msm_host, REG_DSI_DMA_SCHEDULE_CTRL, 0);
+	if (!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) || !msm_host->mode ||
+	    !(dsi_read(msm_host, REG_DSI_STATUS0) &
+	      DSI_STATUS0_VIDEO_MODE_ENGINE_BUSY))
+		return;
+
+	/* Stock schedules only while its video engine state is actually ON. */
+	schedule_line = msm_host->mode->vtotal -
+		(msm_host->mode->vsync_start - msm_host->mode->vdisplay) + 1;
+	val = DSI_DMA_SCHEDULE_CTRL_ENABLE |
+	      DSI_DMA_SCHEDULE_CTRL_LINE(schedule_line);
+	dsi_write(msm_host, REG_DSI_DMA_SCHEDULE_CTRL, val);
+}
+
+void msm_dsi_host_bonded_cmd_stage(struct mipi_dsi_host *host,
+				   const struct mipi_dsi_msg *msg,
+				   u32 dma_base, u32 len, bool master)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	u32 val;
+
+	WRITE_ONCE(msm_host->bonded_polling, !master);
+	val = dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL);
+	val &= ~(DSI_CMD_DMA_CTRL_BROADCAST_MASTER |
+		 DSI_CMD_DMA_CTRL_WC_SEL | DSI_CMD_DMA_CTRL_PACKET_TYPE |
+		 DSI_CMD_DMA_CTRL_LOW_POWER);
+	val |= DSI_CMD_DMA_CTRL_BROADCAST_EN |
+	       DSI_CMD_DMA_CTRL_FROM_FRAME_BUFFER;
+	if (master)
+		val |= DSI_CMD_DMA_CTRL_BROADCAST_MASTER;
+	if (msg->flags & MIPI_DSI_MSG_USE_LPM)
+		val |= DSI_CMD_DMA_CTRL_LOW_POWER;
+	dsi_write(msm_host, REG_DSI_CMD_DMA_CTRL, val);
+
+	val = dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL1);
+	val &= ~DSI_CMD_DMA_CTRL1_MULTI_DMA_BURST_EN;
+	dsi_write(msm_host, REG_DSI_CMD_DMA_CTRL1, val);
+
+	val = dsi_read(msm_host, REG_DSI_DMA_FIFO_CTRL);
+	val |= DSI_DMA_FIFO_CTRL_DISABLE_READ_WATERMARK |
+	       DSI_DMA_FIFO_CTRL_DISABLE_WRITE_WATERMARK;
+	dsi_write(msm_host, REG_DSI_DMA_FIFO_CTRL, val);
+
+	if (msm_host->cfg_hnd->major == MSM_DSI_VER_MAJOR_6G &&
+	    msm_host->cfg_hnd->minor >= MSM_DSI_6G_VER_MINOR_V2_8_0) {
+		val = dsi_read(msm_host, REG_DSI_VBIF_CTRL);
+		val &= ~DSI_VBIF_CTRL_PRIORITY__MASK;
+		val |= DSI_VBIF_CTRL_PRIORITY(7);
+		dsi_write(msm_host, REG_DSI_VBIF_CTRL, val);
+	}
+
+	dsi_write(msm_host, REG_DSI_DMA_BASE, dma_base);
+	dsi_write(msm_host, REG_DSI_DMA_LEN, len & GENMASK(23, 0));
+}
+
+void msm_dsi_host_bonded_cmd_trigger(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+
+	dsi_write(msm_host, REG_DSI_TRIG_DMA, 1);
+}
+
+int msm_dsi_host_bonded_cmd_arm_master(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+
+	dsi_cmd_dma_intr_update(msm_host, false, true);
+	synchronize_irq(msm_host->irq);
+	msm_host->dma_submit_seq++;
+	reinit_completion(&msm_host->dma_comp);
+	dsi_cmd_dma_intr_update(msm_host, true, false);
+	return dsi_read(msm_host, REG_DSI_INTR_CTRL) & DSI_IRQ_MASK_CMD_DMA_DONE ?
+		0 : -EIO;
+}
+
+int msm_dsi_host_bonded_cmd_wait_master(struct mipi_dsi_host *host, u32 len)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	unsigned long completed;
+	u32 status;
+
+	completed = wait_for_completion_timeout(&msm_host->dma_comp,
+						msecs_to_jiffies(200));
+	status = dsi_read(msm_host, REG_DSI_INTR_CTRL);
+	dsi_cmd_dma_intr_update(msm_host, false, false);
+	synchronize_irq(msm_host->irq);
+	if (completed || completion_done(&msm_host->dma_comp)) {
+		if (READ_ONCE(msm_host->dma_done_seq) != msm_host->dma_submit_seq)
+			return -EIO;
+		return len;
+	}
+
+	if (!(status & DSI_IRQ_CMD_DMA_DONE))
+		status = dsi_read(msm_host, REG_DSI_INTR_CTRL);
+	if (status & DSI_IRQ_CMD_DMA_DONE) {
+		dsi_cmd_dma_intr_update(msm_host, false, true);
+		WRITE_ONCE(msm_host->dma_done_seq, msm_host->dma_submit_seq);
+		dev_warn(&msm_host->pdev->dev,
+			 "command DMA completed without IRQ\n");
+		return len;
+	}
+
+	dev_err(&msm_host->pdev->dev, "command DMA timeout: status=%#x\n", status);
+	return -ETIMEDOUT;
+}
+
+int msm_dsi_host_bonded_cmd_poll_slave(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	u32 status = 0;
+	int i;
+
+	for (i = 0; i < 500; i++) {
+		status = dsi_read(msm_host, REG_DSI_INTR_CTRL);
+		if (status & DSI_IRQ_CMD_DMA_DONE) {
+			dsi_cmd_dma_intr_update(msm_host, false, true);
+			return 0;
+		}
+		udelay(10);
+	}
+
+	dev_err(&msm_host->pdev->dev, "peer command DMA timeout: status=%#x\n", status);
+	return -ETIMEDOUT;
+}
+
 int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
 				const struct mipi_dsi_msg *msg)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
+	int ret;
 
 	/* TODO: make sure dsi_cmd_mdp is idle.
 	 * Since DSI6G v1.2.0, we can set DSI_TRIG_CTRL.BLOCK_DMA_WITHIN_FRAME
@@ -2183,9 +2661,17 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
 	 * mdss interrupt is generated in mdp core clock domain
 	 * mdp clock need to be enabled to receive dsi interrupt
 	 */
-	pm_runtime_get_sync(&msm_host->pdev->dev);
-	cfg_hnd->ops->link_clk_set_rate(msm_host);
-	cfg_hnd->ops->link_clk_enable(msm_host);
+	ret = pm_runtime_resume_and_get(&msm_host->pdev->dev);
+	if (ret < 0)
+		return ret;
+
+	ret = dsi_cmd_link_clk_set_rate(msm_host);
+	if (ret)
+		goto err_runtime_put;
+
+	ret = cfg_hnd->ops->link_clk_enable(msm_host);
+	if (ret)
+		goto err_runtime_put;
 
 	/* TODO: vote for bus bandwidth */
 
@@ -2200,6 +2686,10 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
 	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_CMD_DMA_DONE, 1);
 
 	return 0;
+
+err_runtime_put:
+	pm_runtime_put_sync(&msm_host->pdev->dev);
+	return ret;
 }
 
 void msm_dsi_host_xfer_restore(struct mipi_dsi_host *host,
@@ -2366,6 +2856,21 @@ int msm_dsi_host_cmd_rx(struct mipi_dsi_host *host,
 	return ret;
 }
 
+void msm_dsi_host_cmd_xfer_config(struct mipi_dsi_host *host,
+				  bool broadcast, bool master)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	u32 val = dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL);
+
+	val &= ~(BIT(31) | BIT(30));
+	if (broadcast)
+		val |= BIT(31);
+	if (master)
+		val |= BIT(30);
+
+	dsi_write(msm_host, REG_DSI_CMD_DMA_CTRL, val);
+}
+
 void msm_dsi_host_cmd_xfer_commit(struct mipi_dsi_host *host, u32 dma_base,
 				  u32 len)
 {
@@ -2506,6 +3011,15 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 
 	msm_host->byte_intf_clk_div_2 = phy_shared_timings->byte_intf_clk_div_2;
 
+	if (of_device_is_compatible(msm_host->pdev->dev.of_node, "qcom,sm8750-dsi-ctrl")) {
+		msm_host->dma_submit_seq = 0;
+		msm_host->dma_done_seq = 0;
+	}
+
+	msm_host->byte_intf_clk_rate = msm_host->byte_clk_rate;
+	if (phy_shared_timings->byte_intf_clk_div_2)
+		msm_host->byte_intf_clk_rate /= 2;
+
 	msm_dsi_sfpb_config(msm_host, true);
 
 	ret = regulator_bulk_enable(msm_host->cfg_hnd->cfg->num_regulators,
@@ -2517,7 +3031,11 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 	}
 
 	pm_runtime_get_sync(&msm_host->pdev->dev);
-	ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
+	if (of_device_is_compatible(msm_host->pdev->dev.of_node,
+				    "qcom,sm8750-dsi-ctrl"))
+		ret = dsi_link_clk_set_rate_6g_v2_9(msm_host);
+	else
+		ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
 	if (!ret)
 		ret = cfg_hnd->ops->link_clk_enable(msm_host);
 	if (ret) {
@@ -2537,6 +3055,10 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 	dsi_sw_reset(msm_host);
 	dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
 
+	msm_host->link_byte_rate = msm_host->byte_clk_rate;
+	msm_host->link_pixel_rate = msm_host->pixel_clk_rate;
+	msm_host->link_intf_rate = msm_host->byte_intf_clk_rate;
+	WRITE_ONCE(msm_host->link_configured, true);
 	msm_host->power_on = true;
 	mutex_unlock(&msm_host->dev_mutex);
 
@@ -2559,6 +3081,7 @@ int msm_dsi_host_power_off(struct mipi_dsi_host *host)
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
 
 	mutex_lock(&msm_host->dev_mutex);
+	WRITE_ONCE(msm_host->link_configured, false);
 	if (!msm_host->power_on) {
 		DBG("dsi host already off");
 		goto unlock_ret;
@@ -2567,6 +3090,11 @@ int msm_dsi_host_power_off(struct mipi_dsi_host *host)
 	dsi_ctrl_disable(msm_host);
 
 	pinctrl_pm_select_sleep_state(&msm_host->pdev->dev);
+
+	if (msm_host->byte_src_parent)
+		clk_set_parent(msm_host->byte_src_clk, msm_host->byte_src_parent);
+	if (msm_host->pixel_src_parent)
+		clk_set_parent(msm_host->pixel_src_clk, msm_host->pixel_src_parent);
 
 	cfg_hnd->ops->link_clk_disable(msm_host);
 	pm_runtime_put(&msm_host->pdev->dev);
@@ -2590,6 +3118,7 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 
+	WRITE_ONCE(msm_host->link_configured, false);
 	if (msm_host->mode) {
 		drm_mode_destroy(msm_host->dev, msm_host->mode);
 		msm_host->mode = NULL;

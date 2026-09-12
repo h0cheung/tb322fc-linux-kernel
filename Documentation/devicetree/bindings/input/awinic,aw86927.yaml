@@ -12,11 +12,24 @@ maintainers:
 properties:
   compatible:
     oneOf:
-      - const: awinic,aw86927
+      - enum:
+          - awinic,aw86927
+          - awinic,aw86937
       - items:
           - enum:
               - awinic,aw86938
           - const: awinic,aw86927
+
+  firmware-name:
+    description: RAM waveform image containing checksum, base address and waveform table.
+    maxItems: 1
+
+  awinic,ram-waveform-index:
+    description: One-based index of the periodic rumble waveform in the RAM image.
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    maximum: 127
+    default: 1
 
   reg:
     maxItems: 1
@@ -32,6 +45,16 @@ required:
   - reg
   - reset-gpios
   - interrupts
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: awinic,aw86937
+    then:
+      required:
+        - firmware-name
 
 additionalProperties: false
 

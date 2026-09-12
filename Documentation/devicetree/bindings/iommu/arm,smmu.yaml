@@ -19,6 +19,14 @@ description: |+
   conditions.
 
 properties:
+  qcom,preserve-boot-mappings:
+    type: boolean
+    description:
+      Firmware leaves active DMA streams using this SMMU. Import their stream
+      and context-bank assignments without resetting the SMMU or probing live
+      stream registers. Runtime power management remains disabled while
+      preserving these firmware-owned mappings.
+
   $nodename:
     pattern: "^iommu@[0-9a-f]*"
   compatible:

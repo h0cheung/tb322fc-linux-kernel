@@ -2889,6 +2889,7 @@ static struct gdsc gcc_pcie_0_gdsc = {
 	.collapse_mask = BIT(0),
 	.pd = {
 		.name = "gcc_pcie_0_gdsc",
+		.flags = GENPD_FLAG_ACTIVE_WAKEUP,
 	},
 	.pwrsts = PWRSTS_OFF_ON,
 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
@@ -2903,6 +2904,7 @@ static struct gdsc gcc_pcie_0_phy_gdsc = {
 	.collapse_mask = BIT(2),
 	.pd = {
 		.name = "gcc_pcie_0_phy_gdsc",
+		.flags = GENPD_FLAG_ACTIVE_WAKEUP,
 	},
 	.pwrsts = PWRSTS_OFF_ON,
 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
@@ -3189,6 +3191,7 @@ static const struct regmap_config gcc_sm8750_regmap_config = {
 };
 
 static const struct qcom_cc_desc gcc_sm8750_desc = {
+	.use_rpm = true,
 	.config = &gcc_sm8750_regmap_config,
 	.clks = gcc_sm8750_clocks,
 	.num_clks = ARRAY_SIZE(gcc_sm8750_clocks),

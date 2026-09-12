@@ -453,6 +453,8 @@ static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
 	unsigned int last_s2cr;
 	u32 reg;
 	u32 smr;
+	bool preserve = smmu->preserve_boot_mappings;
+	bool exid = false;
 	int i;
 
 	/*
@@ -485,6 +487,7 @@ static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
 	else
 		last_s2cr = ARM_SMMU_GR0_S2CR(smmu->num_mapping_groups - 1);
 
+	if (!preserve) {
 	/*
 	 * With some firmware versions writes to S2CR of type FAULT are
 	 * ignored, and writing BYPASS will end up written as FAULT in the
@@ -512,9 +515,55 @@ static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
 			smmu->num_mapping_groups = 128;
 		}
 	}
+	} else {
+		reg = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sCR0);
+		exid = reg & ARM_SMMU_sCR0_EXIDENABLE;
+		if (smmu->num_mapping_groups > 128)
+			smmu->num_mapping_groups = 128;
+	}
 
 	for (i = 0; i < smmu->num_mapping_groups; i++) {
 		smr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_SMR(i));
+
+		if (preserve) {
+			u32 s2cr = arm_smmu_gr0_read(smmu,
+						      ARM_SMMU_GR0_S2CR(i));
+			bool valid = exid ? s2cr & ARM_SMMU_S2CR_EXIDVALID :
+					    smr & ARM_SMMU_SMR_VALID;
+			u32 decoded_smr = smr;
+			u32 type;
+			u32 cbndx;
+
+			if (!valid)
+				continue;
+			if (!exid)
+				decoded_smr &= ~ARM_SMMU_SMR_VALID;
+
+			smmu->smrs[i].id = FIELD_GET(ARM_SMMU_SMR_ID,
+						     decoded_smr);
+			smmu->smrs[i].mask = FIELD_GET(ARM_SMMU_SMR_MASK,
+						       decoded_smr);
+			/*
+			 * The generic mask-width test is intentionally skipped while
+			 * preserving live firmware mappings. Accept mask bits that the
+			 * hardware is demonstrably using in those imported mappings.
+			 */
+			smmu->smr_mask_mask |= smmu->smrs[i].mask;
+			smmu->smrs[i].valid = true;
+
+			type = FIELD_GET(ARM_SMMU_S2CR_TYPE, s2cr);
+			cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, s2cr);
+			smmu->s2crs[i].type = type;
+			smmu->s2crs[i].privcfg =
+				FIELD_GET(ARM_SMMU_S2CR_PRIVCFG, s2cr);
+			smmu->s2crs[i].cbndx = cbndx;
+			smmu->s2crs[i].count = 1;
+			if (type == S2CR_TYPE_TRANS &&
+			    cbndx < smmu->num_context_banks)
+				set_bit(cbndx, smmu->context_map);
+
+			continue;
+		}
 
 		if (FIELD_GET(ARM_SMMU_SMR_VALID, smr)) {
 			/* Ignore valid bit for SMR mask extraction. */

@@ -1260,10 +1260,19 @@ EXPORT_SYMBOL_GPL(media_create_pad_links);
 
 void __media_entity_remove_links(struct media_entity *entity)
 {
+	struct media_device *mdev = entity->graph_obj.mdev;
 	struct media_link *link, *tmp;
 
 	list_for_each_entry_safe(link, tmp, &entity->links, list)
 		__media_entity_remove_link(entity, link);
+
+	/* Ancillary links have no backlink in the sink entity's list. */
+	list_for_each_entry_safe(link, tmp, &mdev->links, graph_obj.list) {
+		if ((link->flags & MEDIA_LNK_FL_LINK_TYPE) ==
+		    MEDIA_LNK_FL_ANCILLARY_LINK &&
+		    link->gobj1 == &entity->graph_obj)
+			__media_entity_remove_link(entity, link);
+	}
 
 	entity->num_links = 0;
 	entity->num_backlinks = 0;

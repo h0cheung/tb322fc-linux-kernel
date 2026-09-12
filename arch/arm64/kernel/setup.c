@@ -289,7 +289,12 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	early_fixmap_init();
 	early_ioremap_init();
 
+#ifdef CONFIG_BUILTIN_DTB
+	setup_machine_fdt(__pa_symbol(__dtb_start));
+	pr_info("Using built-in device tree\n");
+#else
 	setup_machine_fdt(__fdt_pointer);
+#endif
 
 	/*
 	 * Initialise the static keys early as they may be enabled by the
@@ -338,8 +343,12 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	/* Parse the ACPI tables for possible boot-time configuration */
 	acpi_boot_table_init();
 
-	if (acpi_disabled)
-		unflatten_device_tree();
+	if (acpi_disabled) {
+		if (IS_ENABLED(CONFIG_BUILTIN_DTB))
+			unflatten_and_copy_device_tree();
+		else
+			unflatten_device_tree();
+	}
 
 	bootmem_init();
 

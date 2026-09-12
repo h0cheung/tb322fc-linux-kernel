@@ -122,6 +122,13 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 	if (mode & DSC_MODE_VIDEO)
 		data |= BIT(9);
 
+	/* SM8750 DPU 12.x hardened DSC requires full ICH error precision for
+	 * 10/12-bpc streams; downstream enables ENC_DF_CTRL bit 12 on DPU A00+.
+	 */
+	if (test_bit(DPU_DSC_FULL_ICH_PREC, &hw_dsc->caps->features) &&
+	    dsc->bits_per_component > 8)
+		data |= BIT(12);
+
 	data |= (_dsc_calc_output_buf_max_addr(hw_dsc, num_active_slice_per_enc) << 18);
 
 	DPU_REG_WRITE(hw, sblk->enc.base + ENC_DF_CTRL, data);

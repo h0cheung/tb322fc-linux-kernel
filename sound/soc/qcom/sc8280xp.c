@@ -12,6 +12,7 @@
 #include <sound/jack.h>
 #include <linux/input-event-codes.h>
 #include "qdsp6/q6afe.h"
+#include "qdsp6/q6prm.h"
 #include "common.h"
 #include "sdw.h"
 
@@ -96,6 +97,52 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	return 0;
 }
 
+static int sc8280xp_snd_hw_params(struct snd_pcm_substream *substream,
+				  struct snd_pcm_hw_params *params)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	unsigned int rate = params_rate(params);
+	unsigned int mclk_rate;
+	unsigned int bclk_rate;
+	int ret;
+
+	if (!of_device_is_compatible(rtd->card->dev->of_node, "qcom,sm8750-sndcard"))
+		return 0;
+
+	switch (cpu_dai->id) {
+	case PRIMARY_MI2S_RX ... QUATERNARY_MI2S_TX:
+	case QUINARY_MI2S_RX ... QUINARY_MI2S_TX:
+	case SENARY_MI2S_RX ... SENARY_MI2S_TX:
+		break;
+	default:
+		return 0;
+	}
+
+	mclk_rate = (rate == 11025 || rate == 44100 || rate == 88200) ? 44100 : rate;
+	mclk_rate *= 256;
+	bclk_rate = rate * params_channels(params) *
+		    snd_pcm_format_width(params_format(params));
+
+	ret = snd_soc_dai_set_fmt(cpu_dai, SND_SOC_DAIFMT_BP_FP);
+	if (ret && ret != -ENOTSUPP)
+		return ret;
+
+	ret = snd_soc_dai_set_fmt(codec_dai, SND_SOC_DAIFMT_BC_FC |
+				 SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S);
+	if (ret && ret != -ENOTSUPP)
+		return ret;
+
+	ret = snd_soc_dai_set_sysclk(cpu_dai, LPAIF_MI2S_MCLK, mclk_rate,
+				     SND_SOC_CLOCK_OUT);
+	if (ret)
+		return ret;
+
+	return snd_soc_dai_set_sysclk(cpu_dai, LPAIF_MI2S_BCLK, bclk_rate,
+				      SND_SOC_CLOCK_OUT);
+}
+
 static int sc8280xp_snd_prepare(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
@@ -117,6 +164,7 @@ static int sc8280xp_snd_hw_free(struct snd_pcm_substream *substream)
 static const struct snd_soc_ops sc8280xp_be_ops = {
 	.startup = qcom_snd_sdw_startup,
 	.shutdown = qcom_snd_sdw_shutdown,
+	.hw_params = sc8280xp_snd_hw_params,
 	.hw_free = sc8280xp_snd_hw_free,
 	.prepare = sc8280xp_snd_prepare,
 };
@@ -187,6 +235,7 @@ static struct platform_driver snd_sc8280xp_driver = {
 	.driver = {
 		.name = "snd-sc8280xp",
 		.of_match_table = snd_sc8280xp_dt_match,
+		.pm = &snd_soc_pm_ops,
 	},
 };
 module_platform_driver(snd_sc8280xp_driver);

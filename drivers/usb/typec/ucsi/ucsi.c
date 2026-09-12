@@ -1326,6 +1326,19 @@ static void ucsi_unregister_partner(struct ucsi_connector *con)
 	con->partner = NULL;
 }
 
+static bool ucsi_partner_has_usb(struct ucsi_connector *con)
+{
+	if (!UCSI_CONSTAT(con, CONNECTED))
+		return false;
+
+	if (UCSI_CONSTAT(con, PARTNER_FLAG_USB))
+		return true;
+
+	return (con->ucsi->quirks & UCSI_USB4_IMPLIES_USB) &&
+		(UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN3) ||
+		 UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN4));
+}
+
 static void ucsi_partner_change(struct ucsi_connector *con)
 {
 	enum usb_role u_role = USB_ROLE_NONE;
@@ -1367,10 +1380,7 @@ static void ucsi_partner_change(struct ucsi_connector *con)
 			typec_partner_set_usb_mode(con->partner, USB_MODE_USB4);
 	}
 
-	if ((!UCSI_CONSTAT(con, PARTNER_FLAG_USB)) &&
-	    ((con->ucsi->quirks & UCSI_USB4_IMPLIES_USB) &&
-	     (!(UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN3) ||
-		UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN4)))))
+	if (!ucsi_partner_has_usb(con))
 		u_role = USB_ROLE_NONE;
 
 	ret = usb_role_switch_set_role(con->usb_role_sw, u_role);
@@ -1808,6 +1818,8 @@ static struct fwnode_handle *ucsi_find_fwnode(struct ucsi_connector *con)
 	return NULL;
 }
 
+static void ucsi_unregister_port(struct ucsi_connector *con);
+
 static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 {
 	struct typec_capability *cap = &con->typec_cap;
@@ -1835,9 +1847,12 @@ static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 
 	cap->fwnode = ucsi_find_fwnode(con);
 	con->usb_role_sw = fwnode_usb_role_switch_get(cap->fwnode);
-	if (IS_ERR(con->usb_role_sw))
-		return dev_err_probe(ucsi->dev, PTR_ERR(con->usb_role_sw),
-			"con%d: failed to get usb role switch\n", con->num);
+	if (IS_ERR(con->usb_role_sw)) {
+		ret = dev_err_probe(ucsi->dev, PTR_ERR(con->usb_role_sw),
+				    "con%d: failed to get usb role switch\n", con->num);
+		con->usb_role_sw = NULL;
+		goto out_put;
+	}
 
 	/* Delay other interactions with the con until registration is complete */
 	mutex_lock(&con->lock);
@@ -1847,7 +1862,7 @@ static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 	command |= UCSI_CONNECTOR_NUMBER(con->num);
 	ret = ucsi_send_command(ucsi, command, &con->cap, sizeof(con->cap));
 	if (ret < 0)
-		goto out_unlock;
+		goto out;
 
 	if (UCSI_CONCAP(con, OPMODE_DRP))
 		cap->data = TYPEC_PORT_DRD;
@@ -1952,7 +1967,7 @@ static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 	}
 
 	/* Only notify USB controller if partner supports USB data */
-	if (!(UCSI_CONSTAT(con, PARTNER_FLAG_USB)))
+	if (!ucsi_partner_has_usb(con))
 		u_role = USB_ROLE_NONE;
 
 	ret = usb_role_switch_set_role(con->usb_role_sw, u_role);
@@ -1972,14 +1987,11 @@ static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 	trace_ucsi_register_port(con->num, con);
 
 out:
-	fwnode_handle_put(cap->fwnode);
-out_unlock:
 	mutex_unlock(&con->lock);
-
-	if (ret && con->wq) {
-		destroy_workqueue(con->wq);
-		con->wq = NULL;
-	}
+out_put:
+	fwnode_handle_put(cap->fwnode);
+	if (ret)
+		ucsi_unregister_port(con);
 
 	return ret;
 }
@@ -1987,6 +1999,7 @@ out_unlock:
 static void ucsi_unregister_port(struct ucsi_connector *con)
 {
 	struct ucsi_work *uwork;
+	int ret;
 
 	if (con->wq) {
 		mutex_lock(&con->lock);
@@ -2006,6 +2019,13 @@ static void ucsi_unregister_port(struct ucsi_connector *con)
 	} else {
 		ucsi_unregister_partner(con);
 	}
+
+	ret = usb_role_switch_set_role(con->usb_role_sw, USB_ROLE_NONE);
+	if (ret)
+		dev_warn(con->ucsi->dev, "con%d: failed to clear USB role: %d\n",
+			 con->num, ret);
+	usb_role_switch_put(con->usb_role_sw);
+	con->usb_role_sw = NULL;
 
 	ucsi_unregister_altmodes(con, UCSI_RECIPIENT_CON);
 	ucsi_unregister_port_psy(con);
@@ -2382,6 +2402,7 @@ void ucsi_unregister(struct ucsi *ucsi)
 	}
 
 	kfree(ucsi->connector);
+	ucsi->connector = NULL;
 }
 EXPORT_SYMBOL_GPL(ucsi_unregister);
 

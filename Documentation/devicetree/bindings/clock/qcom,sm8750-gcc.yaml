@@ -34,6 +34,12 @@ properties:
       - description: UFS Phy Tx symbol 0 clock source
       - description: USB3 Phy wrapper pipe clock source
 
+  power-domains:
+    minItems: 1
+    items:
+      - description: CX power domain
+      - description: MX power domain
+
 required:
   - compatible
   - clocks

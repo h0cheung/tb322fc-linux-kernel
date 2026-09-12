@@ -994,12 +994,32 @@ struct dwc3_scratchpad_array {
 /**
  * struct dwc3_glue_ops - The ops indicate the notifications that
  *				need to be passed on to glue layer
- * @pre_set_role: Notify glue of role switch notifications
+ * @pre_set_role: Prepare a role transition; return zero or a negative error
  * @pre_run_stop: Notify run stop enable/disable information to glue
  */
 struct dwc3_glue_ops {
-	void	(*pre_set_role)(struct dwc3 *dwc, enum usb_role role);
+	int	(*pre_set_role)(struct dwc3 *dwc, enum usb_role role);
 	void	(*pre_run_stop)(struct dwc3 *dwc, bool is_on);
+};
+
+struct dwc3_role_port {
+	struct dwc3 *dwc;
+	struct usb_role_switch *sw;
+	struct fwnode_handle *fwnode;
+	enum usb_role role;
+	int state;
+};
+
+struct dwc3_role_mux {
+	struct gpio_desc *select;
+	/* Serialize requests from the two connector role switches. */
+	struct mutex lock;
+	struct dwc3_role_port ports[2];
+	enum usb_role desired_role;
+	int desired_port;
+	int active_port;
+	int error;
+	bool stopping;
 };
 
 /**
@@ -1056,6 +1076,7 @@ struct dwc3_glue_ops {
  *		- USBPHY_INTERFACE_MODE_UTMI
  *		- USBPHY_INTERFACE_MODE_UTMIW
  * @role_sw: usb_role_switch handle
+ * @role_mux: optional shared data-port mux and per-connector role switches
  * @role_switch_default_mode: default operation mode of controller while
  *			usb role is USB_ROLE_NONE.
  * @usb_psy: pointer to power supply interface.
@@ -1248,6 +1269,7 @@ struct dwc3 {
 	struct notifier_block	edev_nb;
 	enum usb_phy_interface	hsphy_mode;
 	struct usb_role_switch	*role_sw;
+	struct dwc3_role_mux	*role_mux;
 	enum usb_dr_mode	role_switch_default_mode;
 
 	struct power_supply	*usb_psy;
@@ -1638,10 +1660,11 @@ void dwc3_event_buffers_cleanup(struct dwc3 *dwc);
 int dwc3_core_soft_reset(struct dwc3 *dwc);
 void dwc3_enable_susphy(struct dwc3 *dwc, bool enable);
 
-static inline void dwc3_pre_set_role(struct dwc3 *dwc, enum usb_role role)
+static inline int dwc3_pre_set_role(struct dwc3 *dwc, enum usb_role role)
 {
 	if (dwc->glue_ops && dwc->glue_ops->pre_set_role)
-		dwc->glue_ops->pre_set_role(dwc, role);
+		return dwc->glue_ops->pre_set_role(dwc, role);
+	return 0;
 }
 
 static inline void dwc3_pre_run_stop(struct dwc3 *dwc, bool is_on)

@@ -645,6 +645,17 @@ static int dsi_phy_driver_probe(struct platform_device *pdev)
 	if (!of_property_read_u32(dev->of_node, "phy-type", &phy_type))
 		phy->cphy_mode = (phy_type == PHY_TYPE_CPHY);
 
+	ret = of_property_read_u8_array(dev->of_node,
+					"qcom,cphy-timing-ctrl",
+					phy->cphy_timing_ctrl,
+					ARRAY_SIZE(phy->cphy_timing_ctrl));
+	if (!ret) {
+		phy->has_cphy_timing_ctrl = true;
+	} else if (ret != -EINVAL) {
+		return dev_err_probe(dev, ret,
+				     "Invalid qcom,cphy-timing-ctrl\n");
+	}
+
 	phy->base = msm_ioremap_size(pdev, "dsi_phy", &phy->base_size);
 	if (IS_ERR(phy->base))
 		return dev_err_probe(dev, PTR_ERR(phy->base),

@@ -2199,6 +2199,44 @@ static struct list_head *cookie_msi_pages(const struct iommu_domain *domain)
 	}
 }
 
+static dma_addr_t iommu_dma_alloc_fixed_msi_iova(struct device *dev,
+						 struct iommu_domain *domain,
+						 size_t size, dma_addr_t address)
+{
+	struct iova_domain *iovad;
+	struct iova *reservation;
+	unsigned long pfn;
+
+	if (domain->cookie_type != IOMMU_COOKIE_DMA_IOVA)
+		return 0;
+	iovad = &domain->iova_cookie->iovad;
+	if (!address || size != iovad->granule ||
+	    !IS_ALIGNED(address, size) || size - 1 > dma_get_mask(dev) ||
+	    address > dma_get_mask(dev) - (size - 1)) {
+		dev_err(dev,
+			"cannot use fixed MSI IOVA (cookie=%u size=%zu granule=%lu)\n",
+			domain->cookie_type, size, iovad->granule);
+		return 0;
+	}
+
+	pfn = iova_pfn(iovad, address);
+	if (find_iova(iovad, pfn)) {
+		dev_err(dev, "fixed MSI IOVA %pad is already allocated\n",
+			&address);
+		return 0;
+	}
+
+	reservation = reserve_iova(iovad, pfn, pfn);
+	if (!reservation || reservation->pfn_lo != pfn ||
+	    reservation->pfn_hi != pfn) {
+		dev_err(dev, "failed to reserve fixed MSI IOVA %pad\n",
+			&address);
+		return 0;
+	}
+
+	return address;
+}
+
 static struct iommu_dma_msi_page *iommu_dma_get_msi_page(struct device *dev,
 		phys_addr_t msi_addr, struct iommu_domain *domain)
 {
@@ -2208,6 +2246,9 @@ static struct iommu_dma_msi_page *iommu_dma_get_msi_page(struct device *dev,
 	int prot = IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO;
 	size_t size = cookie_msi_granule(domain);
 	static DEFINE_MUTEX(msi_prepare_lock);
+	bool fixed_iova = false;
+	u64 fixed_address;
+	bool needs_fixed_iova;
 
 	/*
 	 * Normally a device's default domain is only ever attached to that
@@ -2221,16 +2262,34 @@ static struct iommu_dma_msi_page *iommu_dma_get_msi_page(struct device *dev,
 	 */
 	guard(mutex)(&msi_prepare_lock);
 
+	needs_fixed_iova = of_property_present(dev->of_node, "qcom,msi-iova");
+	if (needs_fixed_iova &&
+	    (of_property_read_u64(dev->of_node, "qcom,msi-iova", &fixed_address) ||
+	     fixed_address != (dma_addr_t)fixed_address)) {
+		dev_err(dev, "invalid fixed MSI IOVA\n");
+		return NULL;
+	}
+
 	msi_addr &= ~(phys_addr_t)(size - 1);
-	list_for_each_entry(msi_page, msi_page_list, list)
-		if (msi_page->phys == msi_addr)
-			return msi_page;
+	list_for_each_entry(msi_page, msi_page_list, list) {
+		if (msi_page->phys != msi_addr)
+			continue;
+		if (needs_fixed_iova && msi_page->iova != fixed_address)
+			continue;
+		return msi_page;
+	}
 
 	msi_page = kzalloc_obj(*msi_page);
 	if (!msi_page)
 		return NULL;
 
-	iova = iommu_dma_alloc_iova(domain, size, dma_get_mask(dev), dev);
+	if (needs_fixed_iova) {
+		iova = iommu_dma_alloc_fixed_msi_iova(dev, domain, size,
+						      fixed_address);
+		fixed_iova = true;
+	} else {
+		iova = iommu_dma_alloc_iova(domain, size, dma_get_mask(dev), dev);
+	}
 	if (!iova)
 		goto out_free_page;
 
@@ -2244,7 +2303,11 @@ static struct iommu_dma_msi_page *iommu_dma_get_msi_page(struct device *dev,
 	return msi_page;
 
 out_free_iova:
-	iommu_dma_free_iova(domain, iova, size, NULL);
+	if (fixed_iova)
+		free_iova(&domain->iova_cookie->iovad,
+			  iova_pfn(&domain->iova_cookie->iovad, iova));
+	else
+		iommu_dma_free_iova(domain, iova, size, NULL);
 out_free_page:
 	kfree(msi_page);
 	return NULL;

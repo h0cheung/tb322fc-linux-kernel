@@ -188,8 +188,11 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 
 	<reg32 offset="0x00038" name="CMD_DMA_CTRL">
 		<bitfield name="BROADCAST_EN" pos="31" type="boolean"/>
+		<bitfield name="BROADCAST_MASTER" pos="30" type="boolean"/>
+		<bitfield name="WC_SEL" pos="29" type="boolean"/>
 		<bitfield name="FROM_FRAME_BUFFER" pos="28" type="boolean"/>
 		<bitfield name="LOW_POWER" pos="26" type="boolean"/>
+		<bitfield name="PACKET_TYPE" pos="24" type="boolean"/>
 	</reg32>
 	<reg32 offset="0x0003c" name="CMD_CFG0">
 		<bitfield name="DST_FORMAT" low="0" high="3" type="dsi_cmd_dst_format"/>
@@ -206,6 +209,10 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 	</reg32>
 	<reg32 offset="0x00044" name="DMA_BASE"/>
 	<reg32 offset="0x00048" name="DMA_LEN"/>
+	<reg32 offset="0x0004c" name="DMA_FIFO_CTRL">
+		<bitfield name="DISABLE_READ_WATERMARK" pos="16" type="boolean"/>
+		<bitfield name="DISABLE_WRITE_WATERMARK" pos="20" type="boolean"/>
+	</reg32>
 	<reg32 offset="0x00054" name="CMD_MDP_STREAM0_CTRL">
 		<bitfield name="DATA_TYPE" low="0" high="5" type="uint"/>
 		<bitfield name="VIRTUAL_CHANNEL" low="8" high="9" type="uint"/>
@@ -233,9 +240,18 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 		<bitfield name="MDP_TRIGGER" low="4" high="6" type="dsi_cmd_trigger"/>
 		<bitfield name="STREAM" low="8" high="9" type="uint"/>
 		<bitfield name="BLOCK_DMA_WITHIN_FRAME" pos="12" type="boolean"/>
+		<bitfield name="DMA_TRG_MUX" pos="16" type="boolean"/>
+		<bitfield name="DMA_TRIGGER_EXT" low="17" high="19" type="uint"/>
 		<bitfield name="TE" pos="31" type="boolean"/>
 	</reg32>
+	<reg32 offset="0x00084" name="EXT_MUX"/>
 	<reg32 offset="0x0008c" name="TRIG_DMA"/>
+	<!-- 6G v2.2+ raw offsets are 0x100/0x104 after DSI_6G_REG_SHIFT. -->
+	<reg32 offset="0x000fc" name="DMA_SCHEDULE_CTRL">
+		<bitfield name="LINE" low="0" high="15" type="uint"/>
+		<bitfield name="ENABLE" pos="28" type="boolean"/>
+	</reg32>
+	<reg32 offset="0x00100" name="DMA_SCHEDULE_CTRL2"/>
 	<reg32 offset="0x000b0" name="DLN0_PHY_ERR">
 		<bitfield name="DLN0_ERR_ESC" pos="0" type="boolean"/>
 		<bitfield name="DLN0_ERR_SYNC_ESC" pos="4" type="boolean"/>
@@ -313,6 +329,12 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 	</reg32>
 	<reg32 offset="0x00128" name="PHY_RESET">
 		<bitfield name="RESET" pos="0" type="boolean"/>
+	</reg32>
+	<reg32 offset="0x001c8" name="VBIF_CTRL">
+		<bitfield name="PRIORITY" low="0" high="2" type="uint"/>
+	</reg32>
+	<reg32 offset="0x0038c" name="CMD_DMA_CTRL1">
+		<bitfield name="MULTI_DMA_BURST_EN" pos="1" type="boolean"/>
 	</reg32>
 	<reg32 offset="0x00160" name="TEST_PATTERN_GEN_VIDEO_INIT_VAL"/>
 	<reg32 offset="0x00198" name="TPG_MAIN_CONTROL">

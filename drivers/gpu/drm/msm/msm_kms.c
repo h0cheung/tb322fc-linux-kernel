@@ -185,6 +185,9 @@ struct drm_gpuvm *msm_kms_init_vm(struct drm_device *dev, struct device *mdss_de
 	struct msm_drm_private *priv = dev->dev_private;
 	struct msm_kms *kms = priv->kms;
 	struct device *iommu_dev;
+	u64 splash_iova;
+	size_t splash_size;
+	int ret;
 
 	/*
 	 * IOMMUs can be a part of MDSS device tree binding, or the
@@ -207,8 +210,24 @@ struct drm_gpuvm *msm_kms_init_vm(struct drm_device *dev, struct device *mdss_de
 			       0x1000, 0x100000000 - 0x1000, true);
 	if (IS_ERR(vm)) {
 		dev_err(mdp_dev, "vm create, error %pe\n", vm);
+		mmu->funcs->detach(mmu);
 		mmu->funcs->destroy(mmu);
 		return vm;
+	}
+
+	if (msm_iommu_disp_get_splash(mmu, &splash_iova, &splash_size)) {
+		ret = msm_gem_vm_reserve(vm, splash_iova, splash_size);
+		if (ret) {
+			dev_err(mdp_dev,
+				"failed to reserve splash IOVA %#llx+%#zx: %d\n",
+				splash_iova, splash_size, ret);
+			mmu->funcs->detach(mmu);
+			drm_gpuvm_put(vm);
+			return ERR_PTR(ret);
+		}
+
+		drm_info(dev, "reserved boot framebuffer IOVA %#llx+%#zx\n",
+			 splash_iova, splash_size);
 	}
 
 	msm_mmu_set_fault_handler(to_msm_vm(vm)->mmu, kms, msm_kms_fault_handler);

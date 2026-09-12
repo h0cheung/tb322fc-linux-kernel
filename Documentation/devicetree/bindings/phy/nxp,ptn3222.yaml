@@ -28,6 +28,19 @@ properties:
 
   reset-gpios: true
 
+  qcom,param-override-seq-c1:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: |
+      Electrical tuning inherited from Qualcomm boot firmware for the C1
+      USB path. Each pair contains an 8-bit value followed by the PTN3222
+      tuning register address, applied after releasing reset.
+    minItems: 1
+    maxItems: 4
+    items:
+      items:
+        - maximum: 255
+        - enum: [6, 7, 8, 10]
+
 required:
   - compatible
   - reg

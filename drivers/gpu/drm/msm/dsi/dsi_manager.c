@@ -3,7 +3,11 @@
  * Copyright (c) 2015, The Linux Foundation. All rights reserved.
  */
 
+#include <linux/mutex.h>
+#include <linux/of.h>
+
 #include "drm/drm_bridge_connector.h"
+#include "drm/drm_panel.h"
 
 #include "msm_kms.h"
 #include "dsi.h"
@@ -25,14 +29,30 @@ struct msm_dsi_manager {
 
 	bool is_bonded_dsi;
 	bool is_sync_needed;
+	bool is_sm8750;
 	int master_dsi_link_id;
 };
 
-static struct msm_dsi_manager msm_dsim_glb;
+static struct msm_dsi_manager msm_dsim_glb = {
+	.master_dsi_link_id = -1,
+};
+
+static DEFINE_MUTEX(dsi_bonded_cmd_lock);
+static bool dsi_bonded_cmd_failed;
 
 #define IS_BONDED_DSI()		(msm_dsim_glb.is_bonded_dsi)
 #define IS_SYNC_NEEDED()	(msm_dsim_glb.is_sync_needed)
 #define IS_MASTER_DSI_LINK(id)	(msm_dsim_glb.master_dsi_link_id == id)
+
+static bool dsi_mgr_uses_bonded_cmd(void)
+{
+	return msm_dsim_glb.is_sm8750 && IS_BONDED_DSI();
+}
+
+bool msm_dsi_manager_cmd_failed(void)
+{
+	return dsi_mgr_uses_bonded_cmd() && READ_ONCE(dsi_bonded_cmd_failed);
+}
 
 static inline struct msm_dsi *dsi_mgr_get_dsi(int id)
 {
@@ -47,6 +67,8 @@ static inline struct msm_dsi *dsi_mgr_get_other_dsi(int id)
 static int dsi_mgr_parse_of(struct device_node *np, int id)
 {
 	struct msm_dsi_manager *msm_dsim = &msm_dsim_glb;
+
+	msm_dsim->is_sm8750 = of_device_is_compatible(np, "qcom,sm8750-dsi-ctrl");
 
 	/* We assume 2 dsi nodes have the same information of bonded dsi and
 	 * sync-mode, and only one node specifies master in case of bonded mode.
@@ -198,6 +220,7 @@ static void dsi_mgr_phy_disable(int id)
 struct dsi_bridge {
 	struct drm_bridge base;
 	int id;
+	bool powered;
 };
 
 #define to_dsi_bridge(x) container_of(x, struct dsi_bridge, base)
@@ -266,6 +289,9 @@ static void dsi_mgr_bridge_power_off(struct drm_bridge *bridge)
 	struct mipi_dsi_host *host = msm_dsi->host;
 	bool is_bonded_dsi = IS_BONDED_DSI();
 
+	if (msm_dsi_manager_cmd_failed())
+		return;
+
 	msm_dsi_host_disable_irq(host);
 	if (is_bonded_dsi && msm_dsi1) {
 		msm_dsi_host_disable_irq(msm_dsi1->host);
@@ -284,6 +310,9 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 	bool is_bonded_dsi = IS_BONDED_DSI();
 	int ret;
 
+	if (msm_dsi_manager_cmd_failed())
+		return;
+
 	DBG("id=%d", id);
 
 	/* Do nothing with the host if it is slave-DSI in case of bonded DSI */
@@ -293,6 +322,12 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 	ret = dsi_mgr_bridge_power_on(bridge);
 	if (ret) {
 		dev_err(&msm_dsi->pdev->dev, "Power on failed: %d\n", ret);
+		return;
+	}
+
+	/* Host power-on already provides LP11 and a command-capable link. */
+	if (msm_dsim_glb.is_sm8750) {
+		to_dsi_bridge(bridge)->powered = true;
 		return;
 	}
 
@@ -318,6 +353,53 @@ host_en_fail:
 	dsi_mgr_bridge_power_off(bridge);
 }
 
+static void dsi_mgr_bridge_enable(struct drm_bridge *bridge)
+{
+	int id = dsi_mgr_bridge_get_id(bridge);
+	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
+	struct msm_dsi *other = dsi_mgr_get_other_dsi(id);
+	struct drm_panel *panel;
+
+	if (!msm_dsim_glb.is_sm8750 ||
+	    !to_dsi_bridge(bridge)->powered ||
+	    msm_dsi_manager_cmd_failed() ||
+	    (IS_BONDED_DSI() && !IS_MASTER_DSI_LINK(id)))
+		return;
+
+	panel = of_drm_find_panel(msm_dsi->next_bridge->of_node);
+	if (IS_ERR(panel))
+		return;
+	if (!panel->prepared) {
+		dev_err(&msm_dsi->pdev->dev,
+			"panel is not prepared; refusing video enable\n");
+		WRITE_ONCE(dsi_bonded_cmd_failed, true);
+		return;
+	}
+
+	/* All bridge pre-enable callbacks, including panel/PPS, have finished. */
+	msm_dsi_host_enable(msm_dsi->host);
+	if (IS_BONDED_DSI() && other)
+		msm_dsi_host_enable(other->host);
+}
+
+static void dsi_mgr_bridge_disable(struct drm_bridge *bridge)
+{
+	int id = dsi_mgr_bridge_get_id(bridge);
+	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
+	struct msm_dsi *other = dsi_mgr_get_other_dsi(id);
+
+	if (!msm_dsim_glb.is_sm8750 ||
+	    !to_dsi_bridge(bridge)->powered ||
+	    msm_dsi_manager_cmd_failed() ||
+	    (IS_BONDED_DSI() && !IS_MASTER_DSI_LINK(id)))
+		return;
+
+	/* Make off commands possible before panel unprepare in post-disable. */
+	msm_dsi_host_disable(msm_dsi->host);
+	if (IS_BONDED_DSI() && other)
+		msm_dsi_host_disable(other->host);
+}
+
 void msm_dsi_manager_tpg_enable(void)
 {
 	struct msm_dsi *m_dsi = dsi_mgr_get_dsi(DSI_0);
@@ -340,6 +422,9 @@ static void dsi_mgr_bridge_post_disable(struct drm_bridge *bridge)
 	bool is_bonded_dsi = IS_BONDED_DSI();
 	int ret;
 
+	if (msm_dsi_manager_cmd_failed())
+		return;
+
 	DBG("id=%d", id);
 
 	/*
@@ -349,6 +434,9 @@ static void dsi_mgr_bridge_post_disable(struct drm_bridge *bridge)
 	 */
 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
 		goto disable_phy;
+
+	if (msm_dsim_glb.is_sm8750)
+		goto disable_irq;
 
 	ret = msm_dsi_host_disable(host);
 	if (ret)
@@ -360,6 +448,8 @@ static void dsi_mgr_bridge_post_disable(struct drm_bridge *bridge)
 			pr_err("%s: host1 disable failed, %d\n", __func__, ret);
 	}
 
+disable_irq:
+	to_dsi_bridge(bridge)->powered = false;
 	msm_dsi_host_disable_irq(host);
 	if (is_bonded_dsi && msm_dsi1)
 		msm_dsi_host_disable_irq(msm_dsi1->host);
@@ -448,6 +538,8 @@ static const struct drm_bridge_funcs dsi_mgr_bridge_funcs = {
 	.attach = dsi_mgr_bridge_attach,
 	.pre_enable = dsi_mgr_bridge_pre_enable,
 	.post_disable = dsi_mgr_bridge_post_disable,
+	.enable = dsi_mgr_bridge_enable,
+	.disable = dsi_mgr_bridge_disable,
 	.mode_set = dsi_mgr_bridge_mode_set,
 	.mode_valid = dsi_mgr_bridge_mode_valid,
 };
@@ -488,38 +580,128 @@ int msm_dsi_manager_connector_init(struct msm_dsi *msm_dsi,
 	return 0;
 }
 
+static bool dsi_mgr_use_bonded_write(const struct mipi_dsi_msg *msg)
+{
+	return dsi_mgr_uses_bonded_cmd() && IS_SYNC_NEEDED() &&
+	       !(msg->rx_buf && msg->rx_len) &&
+	       !(msg->flags & MIPI_DSI_MSG_REQ_ACK);
+}
+
+static int dsi_mgr_bonded_cmd_xfer(const struct mipi_dsi_msg *msg)
+{
+	struct msm_dsi *master_dsi, *slave_dsi;
+	struct mipi_dsi_host *master, *slave;
+	u32 dma_base, len;
+	int master_ret, slave_ret, ret;
+
+	if (msm_dsim_glb.master_dsi_link_id < 0 ||
+	    msm_dsim_glb.master_dsi_link_id >= DSI_MAX)
+		return -EINVAL;
+
+	master_dsi = dsi_mgr_get_dsi(msm_dsim_glb.master_dsi_link_id);
+	slave_dsi = dsi_mgr_get_other_dsi(msm_dsim_glb.master_dsi_link_id);
+	if (!master_dsi || !slave_dsi || !master_dsi->host || !slave_dsi->host)
+		return -ENODEV;
+	master = master_dsi->host;
+	slave = slave_dsi->host;
+
+	if (msm_dsi_manager_cmd_failed())
+		return -EIO;
+
+	ret = msm_dsi_host_bonded_xfer_prepare(master);
+	if (ret)
+		return ret;
+	ret = msm_dsi_host_bonded_xfer_prepare(slave);
+	if (ret)
+		goto restore_master;
+
+	msm_dsi_host_bonded_wait_video(master);
+	msm_dsi_host_bonded_wait_video(slave);
+	ret = msm_dsi_host_bonded_cmd_build(master, msg, &dma_base, &len);
+	if (ret)
+		goto restore_pair;
+	msm_dsi_host_bonded_cmd_init_trigger(master);
+	msm_dsi_host_bonded_cmd_init_trigger(slave);
+	msm_dsi_host_bonded_cmd_stage(master, msg, dma_base, len, true);
+	msm_dsi_host_bonded_cmd_stage(slave, msg, dma_base, len, false);
+
+	/* Flush the packet and both descriptors before starting either engine. */
+	wmb();
+	msm_dsi_host_bonded_cmd_trigger(slave);
+	master_ret = msm_dsi_host_bonded_cmd_arm_master(master);
+	if (!master_ret) {
+		wmb(); /* Enable the completion interrupt before master kickoff. */
+		msm_dsi_host_bonded_cmd_trigger(master);
+		master_ret = msm_dsi_host_bonded_cmd_wait_master(master, len);
+	}
+	/* Resolve the peer even if the master's completion failed. */
+	slave_ret = msm_dsi_host_bonded_cmd_poll_slave(slave);
+	ret = master_ret < 0 ? master_ret : slave_ret < 0 ? slave_ret : len;
+	if (ret < 0) {
+		/* Never reuse a packet buffer while either DMA engine is unresolved. */
+		WRITE_ONCE(dsi_bonded_cmd_failed, true);
+		dev_err(&master_dsi->pdev->dev,
+			"bonded command DMA failed: master=%d peer=%d\n",
+			master_ret, slave_ret);
+		return ret;
+	}
+
+restore_pair:
+	msm_dsi_host_bonded_xfer_restore(master);
+	msm_dsi_host_bonded_xfer_restore(slave);
+	return ret;
+restore_master:
+	msm_dsi_host_bonded_xfer_restore(master);
+	return ret;
+}
+
 int msm_dsi_manager_cmd_xfer(int id, const struct mipi_dsi_msg *msg)
 {
 	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
-	struct msm_dsi *msm_dsi0 = dsi_mgr_get_dsi(DSI_0);
+	struct msm_dsi *sync_peer = dsi_mgr_get_dsi(id == DSI_0 ? DSI_1 : DSI_0);
 	struct mipi_dsi_host *host = msm_dsi->host;
-	bool is_read = (msg->rx_buf && msg->rx_len);
-	bool need_sync = (IS_SYNC_NEEDED() && !is_read);
+	bool is_read = msg->rx_buf && msg->rx_len;
+	bool need_sync = IS_SYNC_NEEDED() && !is_read;
+	bool lock_pair = dsi_mgr_uses_bonded_cmd();
 	int ret;
 
 	if (!msg->tx_buf || !msg->tx_len)
 		return 0;
 
-	/* In bonded master case, panel requires the same commands sent to
-	 * both DSI links. Host issues the command trigger to both links
-	 * when DSI_1 calls the cmd transfer function, no matter it happens
-	 * before or after DSI_0 cmd transfer.
-	 */
-	if (need_sync && (id == DSI_0))
-		return is_read ? msg->rx_len : msg->tx_len;
+	if (lock_pair)
+		mutex_lock(&dsi_bonded_cmd_lock);
 
-	if (need_sync && msm_dsi0) {
-		ret = msm_dsi_host_xfer_prepare(msm_dsi0->host, msg);
+	if (lock_pair && msm_dsi_manager_cmd_failed()) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+
+	if (lock_pair && !is_read && (msg->flags & MIPI_DSI_MSG_REQ_ACK)) {
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	if (dsi_mgr_use_bonded_write(msg)) {
+		ret = dsi_mgr_bonded_cmd_xfer(msg);
+		goto out_unlock;
+	}
+
+	/* In bonded mode, program the peer first and trigger the selected
+	 * command master last. This supports hardware where
+	 * DSI0, not DSI1, is the broadcast master and completion source.
+	 */
+	if (need_sync && sync_peer) {
+		ret = msm_dsi_host_xfer_prepare(sync_peer->host, msg);
 		if (ret) {
 			pr_err("%s: failed to prepare non-trigger host, %d\n",
-				__func__, ret);
-			return ret;
+			       __func__, ret);
+			goto out_unlock;
 		}
 	}
 	ret = msm_dsi_host_xfer_prepare(host, msg);
 	if (ret) {
 		pr_err("%s: failed to prepare host, %d\n", __func__, ret);
-		goto restore_host0;
+		goto restore_peer;
 	}
 
 	ret = is_read ? msm_dsi_host_cmd_rx(host, msg) :
@@ -527,28 +709,38 @@ int msm_dsi_manager_cmd_xfer(int id, const struct mipi_dsi_msg *msg)
 
 	msm_dsi_host_xfer_restore(host, msg);
 
-restore_host0:
-	if (need_sync && msm_dsi0)
-		msm_dsi_host_xfer_restore(msm_dsi0->host, msg);
+restore_peer:
+	if (need_sync && sync_peer)
+		msm_dsi_host_xfer_restore(sync_peer->host, msg);
 
+out_unlock:
+	if (lock_pair)
+		mutex_unlock(&dsi_bonded_cmd_lock);
 	return ret;
 }
 
-bool msm_dsi_manager_cmd_xfer_trigger(int id, u32 dma_base, u32 len)
+int msm_dsi_manager_cmd_xfer_trigger(int id, u32 dma_base, u32 len)
 {
 	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
-	struct msm_dsi *msm_dsi0 = dsi_mgr_get_dsi(DSI_0);
+	struct msm_dsi *sync_peer = dsi_mgr_get_dsi(id == DSI_0 ? DSI_1 : DSI_0);
 	struct mipi_dsi_host *host = msm_dsi->host;
 
-	if (IS_SYNC_NEEDED() && (id == DSI_0))
-		return false;
-
-	if (IS_SYNC_NEEDED() && msm_dsi0)
-		msm_dsi_host_cmd_xfer_commit(msm_dsi0->host, dma_base, len);
+	/* Match Qualcomm's bonded-command hardware protocol. Both controllers
+	 * are put in broadcast mode; the non-master is triggered first, then
+	 * DSI0 is triggered with CMD_DMA_CTRL.MASTER_EN. Only the broadcast
+	 * master owns the completion IRQ waited by dsi_cmd_dma_tx().
+	 */
+	if (IS_SYNC_NEEDED() && sync_peer) {
+		msm_dsi_host_cmd_xfer_config(sync_peer->host, true, false);
+		msm_dsi_host_cmd_xfer_config(host, true, true);
+		msm_dsi_host_cmd_xfer_commit(sync_peer->host, dma_base, len);
+	} else {
+		msm_dsi_host_cmd_xfer_config(host, false, false);
+	}
 
 	msm_dsi_host_cmd_xfer_commit(host, dma_base, len);
 
-	return true;
+	return 1;
 }
 
 int msm_dsi_manager_register(struct msm_dsi *msm_dsi)
@@ -598,6 +790,7 @@ void msm_dsi_manager_unregister(struct msm_dsi *msm_dsi)
 
 	if (msm_dsi->id >= 0)
 		msm_dsim->dsi[msm_dsi->id] = NULL;
+
 }
 
 bool msm_dsi_is_bonded_dsi(struct msm_dsi *msm_dsi)

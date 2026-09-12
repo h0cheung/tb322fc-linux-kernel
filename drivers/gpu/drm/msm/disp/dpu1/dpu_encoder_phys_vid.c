@@ -130,14 +130,19 @@ static void drm_mode_to_intf_timing_params(
 	if (phys_enc->hw_intf->cap->type != INTF_DP && timing->compression_en) {
 		struct drm_dsc_config *dsc =
 		       dpu_encoder_get_dsc_config(phys_enc->parent);
-		/*
-		 * TODO: replace drm_dsc_get_bpp_int with logic to handle
-		 * fractional part if there is fraction
-		 */
-		timing->width = timing->width * drm_dsc_get_bpp_int(dsc) /
-				(dsc->bits_per_component * 3);
-		timing->xres = timing->width;
 		timing->dce_bytes_per_line = msm_dsc_get_bytes_per_line(dsc);
+
+		/*
+		 * Keep the DPU timing generator in lockstep with the DSI host.
+		 * The compressed line is transported in whole bytes, so deriving
+		 * the pixel-clock width from dce_bytes_per_line also accounts for
+		 * fractional bpp and slice chunk padding.  Rounding down here while
+		 * DSI rounds up makes the two blocks disagree by one cycle per line.
+		 */
+		timing->width =
+			DIV_ROUND_UP(timing->dce_bytes_per_line * 8,
+				     dsc->bits_per_component * 3);
+		timing->xres = timing->width;
 	}
 }
 
@@ -601,10 +606,13 @@ static void dpu_encoder_phys_vid_disable(struct dpu_encoder_phys *phys_enc)
 		return;
 	}
 
+	/* Split video timing and shared pipeline cleanup belong to the master. */
+	if (!dpu_encoder_phys_vid_is_master(phys_enc))
+		goto out;
+
 	spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);
 	phys_enc->hw_intf->ops.enable_timing(phys_enc->hw_intf, 0);
-	if (dpu_encoder_phys_vid_is_master(phys_enc))
-		dpu_encoder_phys_inc_pending(phys_enc);
+	dpu_encoder_phys_inc_pending(phys_enc);
 	spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
 
 	/*
@@ -615,14 +623,12 @@ static void dpu_encoder_phys_vid_disable(struct dpu_encoder_phys *phys_enc)
 	 * the settings changes for the new modeset (like new
 	 * scanout buffer) don't latch properly..
 	 */
-	if (dpu_encoder_phys_vid_is_master(phys_enc)) {
-		ret = dpu_encoder_phys_vid_wait_for_tx_complete(phys_enc);
-		if (ret) {
-			atomic_set(&phys_enc->pending_kickoff_cnt, 0);
-			DRM_ERROR("wait disable failed: id:%u intf:%d ret:%d\n",
-				  DRMID(phys_enc->parent),
-				  phys_enc->hw_intf->idx - INTF_0, ret);
-		}
+	ret = dpu_encoder_phys_vid_wait_for_tx_complete(phys_enc);
+	if (ret) {
+		atomic_set(&phys_enc->pending_kickoff_cnt, 0);
+		DRM_ERROR("wait disable failed: id:%u intf:%d ret:%d\n",
+			  DRMID(phys_enc->parent),
+			  phys_enc->hw_intf->idx - INTF_0, ret);
 	}
 
 	if (phys_enc->hw_intf && phys_enc->hw_intf->ops.get_status)
@@ -632,7 +638,7 @@ static void dpu_encoder_phys_vid_disable(struct dpu_encoder_phys *phys_enc)
 	 * Wait for a vsync if timing en status is on after timing engine
 	 * is disabled.
 	 */
-	if (intf_status.is_en && dpu_encoder_phys_vid_is_master(phys_enc)) {
+	if (intf_status.is_en) {
 		spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);
 		dpu_encoder_phys_inc_pending(phys_enc);
 		spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
@@ -646,6 +652,7 @@ static void dpu_encoder_phys_vid_disable(struct dpu_encoder_phys *phys_enc)
 	}
 
 	dpu_encoder_helper_phys_cleanup(phys_enc);
+out:
 	phys_enc->enable_state = DPU_ENC_DISABLED;
 }
 
@@ -659,6 +666,11 @@ static void dpu_encoder_phys_vid_handle_post_kickoff(
 	 * Video encoders need to turn on their interfaces now
 	 */
 	if (phys_enc->enable_state == DPU_ENC_ENABLING) {
+		if (!dpu_encoder_phys_vid_is_master(phys_enc)) {
+			phys_enc->enable_state = DPU_ENC_ENABLED;
+			return;
+		}
+
 		trace_dpu_enc_phys_vid_post_kickoff(DRMID(phys_enc->parent),
 				    phys_enc->hw_intf->idx - INTF_0);
 		spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);

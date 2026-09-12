@@ -147,6 +147,7 @@ static int gdsc_update_collapse_bit(struct gdsc *sc, bool val)
 static int gdsc_toggle_logic(struct gdsc *sc, enum gdsc_status status,
 		bool wait)
 {
+	u32 val;
 	int ret;
 
 	if (status == GDSC_ON && sc->rsupply) {
@@ -159,6 +160,14 @@ static int gdsc_toggle_logic(struct gdsc *sc, enum gdsc_status status,
 		ret = icc_set_bw(sc->icc_path, 1, 1);
 		if (ret)
 			goto err_disable_supply;
+	}
+
+	if (status == GDSC_ON && sc->flags & HW_CTRL_SKIP_DIS) {
+		ret = regmap_read(sc->regmap, sc->gdscr, &val);
+		if (ret)
+			goto err_disable_icc;
+		if (val & HW_CONTROL_MASK)
+			return 0;
 	}
 
 	ret = gdsc_update_collapse_bit(sc, status == GDSC_OFF);
@@ -205,6 +214,9 @@ static int gdsc_toggle_logic(struct gdsc *sc, enum gdsc_status status,
 
 	return ret;
 
+err_disable_icc:
+	if (status == GDSC_ON)
+		icc_set_bw(sc->icc_path, 0, 0);
 err_disable_supply:
 	if (status == GDSC_ON && sc->rsupply)
 		regulator_disable(sc->rsupply);
@@ -350,6 +362,13 @@ static int gdsc_disable(struct generic_pm_domain *domain)
 
 	/* Turn off HW trigger mode if supported */
 	if (sc->flags & HW_CTRL) {
+		if (sc->flags & HW_CTRL_SKIP_DIS) {
+			ret = icc_set_bw(sc->icc_path, 0, 0);
+			if (ret)
+				return ret;
+			return sc->rsupply ? regulator_disable(sc->rsupply) : 0;
+		}
+
 		ret = gdsc_hwctrl(sc, false);
 		if (ret < 0)
 			return ret;

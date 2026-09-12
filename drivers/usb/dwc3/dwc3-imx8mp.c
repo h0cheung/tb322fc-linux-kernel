@@ -158,7 +158,7 @@ static irqreturn_t dwc3_imx8mp_interrupt(int irq, void *_dwc3_imx)
 	return IRQ_HANDLED;
 }
 
-static void dwc3_imx_pre_set_role(struct dwc3 *dwc, enum usb_role role)
+static int dwc3_imx_pre_set_role(struct dwc3 *dwc, enum usb_role role)
 {
 	if (role == USB_ROLE_HOST)
 		/*
@@ -171,6 +171,8 @@ static void dwc3_imx_pre_set_role(struct dwc3 *dwc, enum usb_role role)
 		pm_runtime_dont_use_autosuspend(dwc->dev);
 	else
 		pm_runtime_use_autosuspend(dwc->dev);
+
+	return 0;
 }
 
 struct dwc3_glue_ops dwc3_imx_glue_ops = {

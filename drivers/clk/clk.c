@@ -64,6 +64,7 @@ struct clk_parent_map {
 };
 
 struct clk_core {
+	bool orphan_reparent_failed;
 	const char		*name;
 	const struct clk_ops	*ops;
 	struct clk_hw		*hw;
@@ -3826,6 +3827,55 @@ static inline void clk_debug_unregister(struct clk_core *core)
 }
 #endif
 
+static int clk_core_reparent_orphan_nolock(struct clk_core *orphan,
+					   struct clk_core *parent)
+{
+	bool parent_ops_enabled = false;
+	bool parent_migration_enabled = false;
+	bool core_migration_enabled = false;
+	unsigned long flags;
+	int ret;
+
+	if (orphan->flags & CLK_OPS_PARENT_ENABLE) {
+		ret = clk_core_prepare_enable(parent);
+		if (ret)
+			return ret;
+		parent_ops_enabled = true;
+	}
+
+	if (orphan->prepare_count) {
+		ret = clk_core_prepare_enable(parent);
+		if (ret)
+			goto err_disable_ops_parent;
+		parent_migration_enabled = true;
+
+		ret = clk_core_enable_lock(orphan);
+		if (ret)
+			goto err_disable_migration_parent;
+		core_migration_enabled = true;
+	}
+
+	flags = clk_enable_lock();
+	clk_reparent(orphan, parent);
+	clk_enable_unlock(flags);
+
+	if (core_migration_enabled)
+		clk_core_disable_lock(orphan);
+	if (parent_ops_enabled)
+		clk_core_disable_unprepare(parent);
+
+	/* Keep the migration reference on the new parent. */
+	return 0;
+
+err_disable_migration_parent:
+	if (parent_migration_enabled)
+		clk_core_disable_unprepare(parent);
+err_disable_ops_parent:
+	if (parent_ops_enabled)
+		clk_core_disable_unprepare(parent);
+	return ret;
+}
+
 static void clk_core_reparent_orphans_nolock(void)
 {
 	struct clk_core *orphan;
@@ -3839,15 +3889,24 @@ static void clk_core_reparent_orphans_nolock(void)
 		struct clk_core *parent = __clk_init_parent(orphan);
 
 		/*
-		 * We need to use __clk_set_parent_before() and _after() to
-		 * properly migrate any prepare/enable count of the orphan
+		 * We need to migrate any prepare/enable count of the orphan
 		 * clock. This is important for CLK_IS_CRITICAL clocks, which
 		 * are enabled during init but might not have a parent yet.
 		 */
 		if (parent) {
-			/* update the clk tree topology */
-			__clk_set_parent_before(orphan, parent);
-			__clk_set_parent_after(orphan, parent, NULL);
+			int ret;
+
+			if (orphan->orphan_reparent_failed)
+				continue;
+
+			ret = clk_core_reparent_orphan_nolock(orphan, parent);
+			if (ret) {
+				orphan->orphan_reparent_failed = true;
+				pr_err_ratelimited("%s: orphan reparent failed: %d\n",
+						   orphan->name, ret);
+				continue;
+			}
+
 			__clk_recalc_accuracies(orphan);
 			__clk_recalc_rates(orphan, true, 0);
 
