@@ -968,7 +968,7 @@ TEST(wake_all)
 	auto_event_args.manual = false;
 	auto_event_args.signaled = true;
 	objs[3] = ioctl(fd, NTSYNC_IOC_CREATE_EVENT, &auto_event_args);
-	EXPECT_EQ(0, objs[3]);
+	EXPECT_LE(0, objs[3]);
 
 	wait_args.timeout = get_abs_timeout(1000);
 	wait_args.objs = (uintptr_t)objs;
@@ -1271,7 +1271,8 @@ TEST(alert_all)
 #define STRESS_LOOPS 10000
 #define STRESS_THREADS 4
 
-static unsigned int stress_counter;
+/* The ioctl-based mutex is invisible to the compiler. */
+static volatile unsigned int stress_counter;
 static int stress_device, stress_start_event, stress_mutex;
 
 static void *stress_thread(void *arg)
