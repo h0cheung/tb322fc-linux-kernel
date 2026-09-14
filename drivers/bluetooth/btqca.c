@@ -442,7 +442,8 @@ static int qca_tlv_check_data(struct hci_dev *hdev,
 				 * enabling software inband sleep
 				 * onto controller side.
 				 */
-				tlv_nvm->data[0] |= 0x80;
+				if (soc_type != QCA_WCN7861)
+					tlv_nvm->data[0] |= 0x80;
 
 				/* UART Baud Rate */
 				if (soc_type >= QCA_WCN3991)
@@ -453,6 +454,14 @@ static int qca_tlv_check_data(struct hci_dev *hdev,
 				break;
 
 			case EDL_TAG_ID_DEEP_SLEEP:
+				/* WCN7861 stores the IBS enable bit in the second byte. */
+				if (soc_type == QCA_WCN7861) {
+					if (tag_len < 2)
+						return -EINVAL;
+					tlv_nvm->data[1] |= 0x01;
+					break;
+				}
+
 				if (tag_len < 1)
 					return -EINVAL;
 
