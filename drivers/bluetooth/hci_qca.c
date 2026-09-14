@@ -23,6 +23,8 @@
 #include <linux/devcoredump.h>
 #include <linux/device.h>
 #include <linux/gpio/consumer.h>
+#include <linux/firmware.h>
+#include <linux/elf.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/acpi.h>
@@ -44,6 +46,33 @@
 #define HCI_IBS_SLEEP_IND	0xFE
 #define HCI_IBS_WAKE_IND	0xFD
 #define HCI_IBS_WAKE_ACK	0xFC
+
+/* Peripheral-controller protocol used before WCN7861 Bluetooth setup. */
+#define QCA_PERI_COMMAND_PKT	0x31
+#define QCA_PERI_EVENT_PKT	0x34
+#define QCA_PERI_EDL_OPCODE	0xfff0
+#define QCA_PERI_GENERAL_OPCODE	0xfff1
+#define QCA_PERI_SEGMENT_SIZE	243
+#define QCA_PERI_PATCHED		0x17
+
+enum qca_peripheral_state {
+	QCA_PERI_IDLE,
+	QCA_PERI_WAKE,
+	QCA_PERI_COMMAND,
+};
+
+enum qca_peripheral_notification {
+	QCA_PERI_NOTIFY_NONE,
+	QCA_PERI_NOTIFY_PATCH,
+	QCA_PERI_NOTIFY_ACTIVATE,
+	QCA_PERI_NOTIFY_TME,
+};
+
+enum qca_peripheral_firmware {
+	QCA_PERI_FIRMWARE,
+	QCA_PERI_NVM,
+	QCA_PERI_TME,
+};
 #define HCI_MAX_IBS_SIZE	10
 
 #define IBS_WAKE_RETRANS_TIMEOUT_MS	100
@@ -138,6 +167,15 @@ struct qca_dump_size {
 } __packed;
 
 struct qca_data {
+	struct completion peri_done;
+	enum qca_peripheral_state peri_state;
+	u16 peri_opcode;
+	u8 peri_subopcode;
+	u8 peri_status;
+	u8 peri_ssid;
+	bool peri_supported;
+	enum qca_peripheral_notification peri_notify;
+	struct completion peri_ready;
 	struct hci_uart *hu;
 	struct sk_buff *rx_skb;
 	struct sk_buff_head txq;
@@ -987,6 +1025,13 @@ static int qca_ibs_wake_ind(struct hci_dev *hdev, struct sk_buff *skb)
 static int qca_ibs_wake_ack(struct hci_dev *hdev, struct sk_buff *skb)
 {
 	struct hci_uart *hu = hci_get_drvdata(hdev);
+	struct qca_data *qca = hu->priv;
+
+	if (qca->peri_state == QCA_PERI_WAKE) {
+		complete(&qca->peri_done);
+		kfree_skb(skb);
+		return 0;
+	}
 
 	BT_DBG("hu %p recv hci ibs cmd 0x%x", hu, HCI_IBS_WAKE_ACK);
 
@@ -1266,7 +1311,60 @@ static int qca_recv_event(struct hci_dev *hdev, struct sk_buff *skb)
 	.lsize = 0, \
 	.maxlen = HCI_MAX_IBS_SIZE
 
+static int qca_recv_peripheral(struct hci_dev *hdev, struct sk_buff *skb)
+{
+	struct hci_uart *hu = hci_get_drvdata(hdev);
+	struct qca_data *qca = hu->priv;
+	const u8 *data = skb->data;
+
+	/* H4 has removed the packet type: host ID, event, length, vendor ID. */
+	if (skb->len < 7 || data[0] || data[1] != 0xff || data[3] != 0xf0)
+		goto free;
+
+	if ((qca->peri_notify == QCA_PERI_NOTIFY_PATCH &&
+	     data[4] == 3 && data[5] == 0 && data[6] == 0) ||
+	    (qca->peri_notify == QCA_PERI_NOTIFY_TME &&
+	     data[4] == 3 && data[5] == 0 && data[6] == 3) ||
+	    (qca->peri_notify == QCA_PERI_NOTIFY_ACTIVATE &&
+	     data[4] == 2 && data[5] == 1 && data[6] == 1))
+		complete(&qca->peri_ready);
+
+	if (qca->peri_state != QCA_PERI_COMMAND)
+		goto free;
+
+	/* Activate uses command status, followed by an async notification. */
+	if (qca->peri_opcode == QCA_PERI_GENERAL_OPCODE &&
+	    qca->peri_subopcode == 0 && skb->len >= 9 && data[4] == 0 &&
+	    get_unaligned_le16(data + 7) == QCA_PERI_GENERAL_OPCODE) {
+		qca->peri_status = data[5];
+		complete(&qca->peri_done);
+		goto free;
+	}
+
+	if (skb->len < 10 || data[4] != 1 ||
+	    get_unaligned_le16(data + 6) != qca->peri_opcode ||
+	    data[9] != qca->peri_subopcode)
+		goto free;
+
+	if (qca->peri_opcode == QCA_PERI_EDL_OPCODE) {
+		if (skb->len < 11 || data[10] != qca->peri_ssid)
+			goto free;
+		if (data[9] == 5)
+			qca->peri_supported = !data[8] && skb->len >= 24 &&
+				get_unaligned_le32(data + 11) == 0x21 &&
+				get_unaligned_le16(data + 17) == 0x200 &&
+				get_unaligned_le32(data + 19) == 0x40210200;
+	}
+	qca->peri_status = data[8];
+	complete(&qca->peri_done);
+free:
+	kfree_skb(skb);
+	return 0;
+}
+
 static const struct h4_recv_pkt qca_recv_pkts[] = {
+	{ .type = QCA_PERI_EVENT_PKT, .hlen = 3, .loff = 2, .lsize = 1,
+	  .maxlen = 258, .recv = qca_recv_peripheral },
 	{ H4_RECV_ACL,             .recv = qca_recv_acl_data },
 	{ H4_RECV_SCO,             .recv = hci_recv_frame    },
 	{ H4_RECV_EVENT,           .recv = qca_recv_event    },
@@ -1564,7 +1662,7 @@ error:
 			 * for the baudrate change command.
 			 */
 			if (!wait_for_completion_timeout(&qca->drop_ev_comp,
-						 msecs_to_jiffies(100))) {
+			    msecs_to_jiffies(100))) {
 				bt_dev_err(hu->hdev,
 					   "Failed to change controller baudrate\n");
 				ret = -ETIMEDOUT;
@@ -1923,11 +2021,219 @@ qca_wcn7861_uses_current_baudrate(const struct qca_btsoc_version *ver)
 	 * The Qualcomm Peach HAL deliberately skips SetBaudRateReq for these
 	 * four product/ROM tuples and starts the TLV download at the UART rate
 	 * which was used successfully for the version request.  Sending 0xfc48
-	 * here instead leaves the Elden Peach v2 controller silent.
+	 * here instead leaves the controller silent; the peripheral protocol
+	 * has already selected the operating rate before this request.
 	 */
 	return ((soc_id == 0x40210100 && rom_ver == 0x0100) ||
 		(soc_id == 0x40210200 && rom_ver == 0x0200)) &&
 	       (product_id == 0x1e || product_id == 0x21);
+}
+
+static int qca_peripheral_request(struct hci_uart *hu, const u8 *cmd,
+				  size_t len, unsigned int speed, bool wait)
+{
+	struct qca_data *qca = hu->priv;
+	struct sk_buff *skb;
+	int ret;
+
+	skb = bt_skb_alloc(len, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+	skb_put_data(skb, cmd, len);
+	reinit_completion(&qca->peri_done);
+	qca->peri_opcode = get_unaligned_le16(cmd + 2);
+	qca->peri_subopcode = cmd[5];
+	qca->peri_ssid = len > 6 ? cmd[6] : 0;
+	qca->peri_status = 0xff;
+	qca->peri_state = QCA_PERI_COMMAND;
+	if (speed)
+		hci_uart_set_flow_control(hu, true);
+	skb_queue_tail(&qca->txq, skb);
+	hci_uart_tx_wakeup(hu);
+	if (speed) {
+		ret = hci_uart_wait_until_sent(hu);
+		if (ret) {
+			hci_uart_set_flow_control(hu, false);
+			return ret;
+		}
+		serdev_device_wait_until_sent(hu->serdev, msecs_to_jiffies(100));
+		msleep(20);
+		ret = serdev_device_set_baudrate(hu->serdev, speed);
+		hci_uart_set_flow_control(hu, false);
+		if (ret != speed)
+			return -EINVAL;
+	}
+	if (!wait)
+		return 0;
+	ret = wait_for_completion_timeout(&qca->peri_done, msecs_to_jiffies(3000));
+	qca->peri_state = QCA_PERI_IDLE;
+	return ret ? qca->peri_status : -ETIMEDOUT;
+}
+
+static int qca_peripheral_download(struct hci_uart *hu, const char *name,
+				   enum qca_peripheral_firmware type)
+{
+	const struct firmware *fw;
+	u8 cmd[QCA_PERI_SEGMENT_SIZE + 8] = { QCA_PERI_COMMAND_PKT, 0, 0xf0, 0xff, 0, 6, 0, 0 };
+	u8 *data;
+	bool nvm = type == QCA_PERI_NVM, tme = type == QCA_PERI_TME;
+	size_t offset, len;
+	int ret;
+
+	ret = request_firmware(&fw, name, &hu->serdev->dev);
+	if (ret)
+		return ret;
+	if (fw->size < 24 || fw->size > 65536 ||
+	    (tme ? (memcmp(fw->data, ELFMAG, SELFMAG) ||
+		    fw->data[EI_CLASS] != ELFCLASS32 ||
+		    fw->data[EI_DATA] != ELFDATA2LSB) :
+	     (fw->data[0] != (nvm ? 2 : 1) ||
+	      (get_unaligned_le32(fw->data) >> 8) != fw->size - 4 ||
+	      (!nvm && (get_unaligned_le16(fw->data + 16) != 0x21 ||
+			get_unaligned_le16(fw->data + 18) != 0x200 || fw->data[14] != 3))))) {
+		ret = -EINVAL;
+		goto release;
+	}
+	cmd[6] = tme ? 3 : 0;
+	data = kmemdup(fw->data, fw->size, GFP_KERNEL);
+	if (!data) {
+		ret = -ENOMEM;
+		goto release;
+	}
+	if (nvm) {
+		for (offset = 4; offset < fw->size; offset += 12 + len) {
+			u16 tag;
+
+			if (fw->size - offset < 12) {
+				ret = -EINVAL;
+				goto free;
+			}
+			tag = get_unaligned_le16(data + offset);
+			len = get_unaligned_le16(data + offset + 2);
+			if (len > fw->size - offset - 12 ||
+			    ((tag == 17 || tag == 27) && len < 2)) {
+				ret = -EINVAL;
+				goto free;
+			}
+			if (tag == 17)
+				data[offset + 13] = QCA_BAUDRATE_8000000;
+			if (tag == 27)
+				data[offset + 13] |= 1;
+		}
+	}
+	for (offset = 0; offset < fw->size; offset += len) {
+		len = min_t(size_t, QCA_PERI_SEGMENT_SIZE, fw->size - offset);
+		cmd[4] = len + 3;
+		cmd[7] = len;
+		memcpy(cmd + 8, data + offset, len);
+		ret = qca_peripheral_request(hu, cmd, len + 8, 0,
+					     nvm || offset + len == fw->size);
+		if (ret)
+			break;
+	}
+free:
+	kfree(data);
+release:
+	release_firmware(fw);
+	return ret;
+}
+
+static int qca_peripheral_wake(struct hci_uart *hu)
+{
+	struct qca_data *qca = hu->priv;
+	int ret;
+
+	reinit_completion(&qca->peri_done);
+	qca->peri_state = QCA_PERI_WAKE;
+	ret = send_hci_ibs_cmd(HCI_IBS_WAKE_IND, hu);
+	if (ret)
+		return ret;
+	hci_uart_tx_wakeup(hu);
+	return wait_for_completion_timeout(&qca->peri_done,
+					   msecs_to_jiffies(100)) ? 0 : -ETIMEDOUT;
+}
+
+static int qca_peripheral_setup(struct hci_uart *hu)
+{
+	static const u8 version[] = { 0x31, 0x00, 0xf0, 0xff, 0x02, 0x05, 0x00 };
+	static const u8 baud[] = { 0x31, 0x00, 0xf1, 0xff, 0x02, 0x02, 0x15 };
+	static const u8 tme_version[] = { 0x31, 0, 0xf0, 0xff, 2, 5, 3 };
+	static const u8 tme[] = { 0x31, 0, 0xf0, 0xff, 3, 8, 3, 0 };
+	static const u8 activate[] = { 0x31, 0, 0xf1, 0xff, 3, 0, 1, 1 };
+	static const u8 reset[] = { 0x31, 0, 0xf1, 0xff, 1, 3 };
+	static const u8 arbitrate[] = { 0x31, 0x00, 0xf0, 0xff, 0x03, 0x08, 0x00, 0x00 };
+	struct qca_data *qca = hu->priv;
+	int ret;
+
+	init_completion(&qca->peri_done);
+	init_completion(&qca->peri_ready);
+	ret = qca_peripheral_wake(hu);
+	if (ret)
+		return ret;
+	ret = qca_peripheral_request(hu, version, sizeof(version), 0, true);
+	if (ret)
+		return ret;
+	if (!qca->peri_supported)
+		return -ENODEV;
+	ret = qca_peripheral_request(hu, baud, sizeof(baud), 8000000, true);
+	if (ret != 1)
+		return ret ? ret : -EIO;
+	ret = qca_peripheral_request(hu, arbitrate, sizeof(arbitrate), 0, true);
+	if (ret == QCA_PERI_PATCHED)
+		goto patched;
+	if (ret)
+		return ret;
+	ret = qca_peripheral_download(hu, "qca/brhperifw20.tlv", QCA_PERI_FIRMWARE);
+	if (ret)
+		return ret;
+	ret = qca_peripheral_download(hu, "qca/brhperinv20.bin", QCA_PERI_NVM);
+	if (ret)
+		return ret;
+	qca->peri_notify = QCA_PERI_NOTIFY_PATCH;
+	ret = qca_peripheral_request(hu, reset, sizeof(reset), 0, true);
+	if (ret)
+		return ret;
+	ret = wait_for_completion_timeout(&qca->peri_ready, msecs_to_jiffies(3000));
+	qca->peri_notify = QCA_PERI_NOTIFY_NONE;
+	if (!ret)
+		return -ETIMEDOUT;
+patched:
+	ret = qca_peripheral_wake(hu);
+	if (ret)
+		return ret;
+	ret = qca_peripheral_request(hu, tme, sizeof(tme), 0, true);
+	if (ret == 0 || ret == QCA_PERI_PATCHED) {
+		bool patched = ret == QCA_PERI_PATCHED;
+
+		qca->peri_supported = false;
+		ret = qca_peripheral_request(hu, tme_version, sizeof(tme_version), 0, true);
+		if (ret || !qca->peri_supported)
+			return ret < 0 ? ret : -ENODEV;
+		if (!patched) {
+			reinit_completion(&qca->peri_ready);
+			qca->peri_notify = QCA_PERI_NOTIFY_TME;
+			ret = qca_peripheral_download(hu, "qca/tmel_peach_20.elf", QCA_PERI_TME);
+			if (ret)
+				return ret;
+			ret = wait_for_completion_timeout(&qca->peri_ready,
+							  msecs_to_jiffies(3000));
+			qca->peri_notify = QCA_PERI_NOTIFY_NONE;
+			if (!ret)
+				return -ETIMEDOUT;
+		}
+	} else if (ret != 5 && ret != 6) {
+		return ret < 0 ? ret : -EOPNOTSUPP;
+	}
+	reinit_completion(&qca->peri_ready);
+	qca->peri_notify = QCA_PERI_NOTIFY_ACTIVATE;
+	ret = qca_peripheral_request(hu, activate, sizeof(activate), 0, true);
+	if (ret == QCA_PERI_PATCHED)
+		ret = 0;
+	else if (!ret)
+		ret = wait_for_completion_timeout(&qca->peri_ready,
+						  msecs_to_jiffies(3000)) ? 0 : -ETIMEDOUT;
+	qca->peri_notify = QCA_PERI_NOTIFY_NONE;
+	return ret;
 }
 
 static int qca_setup(struct hci_uart *hu)
@@ -2000,6 +2306,17 @@ retry:
 
 	clear_bit(QCA_SSR_TRIGGERED, &qca->flags);
 
+	if (soc_type == QCA_WCN7861) {
+		ret = qca_peripheral_setup(hu);
+		qca->peri_state = QCA_PERI_IDLE;
+		qca->peri_notify = QCA_PERI_NOTIFY_NONE;
+		if (ret) {
+			bt_dev_err(hdev, "Peripheral setup failed: %d", ret);
+			qca_power_off(hu);
+			return ret < 0 ? ret : -EIO;
+		}
+	}
+
 	switch (soc_type) {
 	case QCA_WCN3950:
 	case QCA_WCN3988:
@@ -2036,14 +2353,10 @@ retry:
 		qca_baudrate = qca_get_baudrate_value(speed);
 	} else if (speed) {
 		/*
-		 * Stock still writes the configured operating-rate code into the
-		 * new-format NVM HCI tag.  This value does not change the live UART
-		 * used to download rampatch and NVM.
+		 * The peripheral protocol selected the UART operating rate before
+		 * Bluetooth setup. Keep the NVM HCI tag at that rate too.
 		 */
 		qca_baudrate = qca_get_baudrate_value(speed);
-		bt_dev_info(hdev,
-			    "QCA Peach downloads at current UART rate; skipping 0xfc48 (NVM baud 0x%02x)",
-			    qca_baudrate);
 	}
 
 	switch (soc_type) {
@@ -2907,3 +3220,7 @@ int __exit qca_deinit(void)
 
 	return hci_uart_unregister_proto(&qca_proto);
 }
+
+MODULE_FIRMWARE("qca/brhperifw20.tlv");
+MODULE_FIRMWARE("qca/brhperinv20.bin");
+MODULE_FIRMWARE("qca/tmel_peach_20.elf");
