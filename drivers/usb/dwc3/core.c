@@ -224,8 +224,8 @@ static void __dwc3_set_mode(struct work_struct *work)
 	}
 	spin_unlock_irqrestore(&dwc->lock, flags);
 
-	if (mux && READ_ONCE(mux->error))
-		goto unlock;
+	if (mux)
+		WRITE_ONCE(mux->error, 0);
 
 	ret = pm_runtime_resume_and_get(dwc->dev);
 	if (ret < 0)
@@ -267,9 +267,6 @@ static void __dwc3_set_mode(struct work_struct *work)
 	}
 
 	if (mux) {
-		ret = dwc3_check_halted(dwc);
-		if (ret)
-			goto mode_failed;
 		ret = dwc3_pre_set_role(dwc, mux_role);
 		if (ret)
 			goto mode_failed;

@@ -523,10 +523,7 @@ static int dwc3_mux_role_set(struct usb_role_switch *sw, enum usb_role role)
 		ret = -ESHUTDOWN;
 		goto out;
 	}
-	if (READ_ONCE(mux->error)) {
-		ret = READ_ONCE(mux->error);
-		goto out;
-	}
+	WRITE_ONCE(mux->error, 0);
 
 	port->role = role;
 	if (mux->ports[0].role != USB_ROLE_NONE)
