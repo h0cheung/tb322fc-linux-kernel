@@ -153,6 +153,8 @@ static int novatek_unprepare(struct drm_panel *panel)
 	if (ret < 0)
 		dev_err(dev, "Failed to un-initialize panel: %d\n", ret);
 
+	/* Allow the panel to enter sleep before asserting reset. */
+	msleep(70);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 	regulator_bulk_disable(ARRAY_SIZE(novatek_supplies), ctx->supplies);
 
