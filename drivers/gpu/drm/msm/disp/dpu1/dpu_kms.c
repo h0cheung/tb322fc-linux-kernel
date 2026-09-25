@@ -1462,6 +1462,17 @@ static int __maybe_unused dpu_runtime_resume(struct device *dev)
 
 	ddev = dpu_kms->dev;
 
+	/*
+	 * CRTC disable may have dropped the OPP vote without changing the
+	 * core clock rate. Restore the vote before enabling clocks and
+	 * accessing registers; atomic_flush updates scanout performance later.
+	 */
+	rc = dev_pm_opp_set_rate(dev, dpu_kms_get_clk_rate(dpu_kms, "core"));
+	if (rc) {
+		DPU_ERROR("failed to restore core clock OPP rc:%d\n", rc);
+		return rc;
+	}
+
 	rc = clk_bulk_prepare_enable(dpu_kms->num_clocks, dpu_kms->clocks);
 	if (rc) {
 		DPU_ERROR("clock enable failed rc:%d\n", rc);
