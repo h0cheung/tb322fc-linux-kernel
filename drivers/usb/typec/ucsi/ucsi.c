@@ -1327,10 +1327,18 @@ static void ucsi_unregister_partner(struct ucsi_connector *con)
 
 static bool ucsi_partner_has_usb(struct ucsi_connector *con)
 {
+	u8 partner_type;
+
 	if (!UCSI_CONSTAT(con, CONNECTED))
 		return false;
 
 	if (UCSI_CONSTAT(con, PARTNER_FLAG_USB))
+		return true;
+
+	partner_type = UCSI_CONSTAT(con, PARTNER_TYPE);
+	if (partner_type == UCSI_CONSTAT_PARTNER_TYPE_UFP ||
+	    partner_type == UCSI_CONSTAT_PARTNER_TYPE_CABLE_AND_UFP ||
+	    partner_type == UCSI_CONSTAT_PARTNER_TYPE_DFP)
 		return true;
 
 	return (con->ucsi->quirks & UCSI_USB4_IMPLIES_USB) &&
@@ -1368,7 +1376,8 @@ static void ucsi_partner_change(struct ucsi_connector *con)
 			typec_set_mode(con->port, TYPEC_MODE_AUDIO);
 			break;
 		default:
-			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB))
+			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB) ||
+			    ucsi_partner_has_usb(con))
 				typec_set_mode(con->port, TYPEC_STATE_USB);
 		}
 
