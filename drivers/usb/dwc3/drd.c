@@ -531,7 +531,7 @@ static int dwc3_mux_role_set(struct usb_role_switch *sw, enum usb_role role)
 	else if (mux->ports[1].role != USB_ROLE_NONE)
 		selected = 1;
 	else
-		selected = mux->desired_port;
+		selected = 0;
 	selected_role = mux->ports[selected].role;
 	if (selected == mux->desired_port && selected_role == mux->desired_role) {
 		ret = 0;
