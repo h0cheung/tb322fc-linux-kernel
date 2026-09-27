@@ -37,6 +37,16 @@
  */
 #define UCSI_SWAP_TIMEOUT_MS	5000
 
+/*
+ * Y700 (Lenovo Legion Y700 Gen4, SM8750): the two USB-C connectors share one
+ * DWC3 controller and the long-edge port always wins. A power-only charger
+ * reports no PARTNER_FLAG_USB while the tablet sinks power from it, yet the
+ * PMIC UCSI firmware still gives it a UFP/DFP partner type, so the kernel
+ * claims USB_ROLE_HOST/DEVICE for the long edge and starves the short-edge
+ * gamepad. Such a USB-less power source yields USB_ROLE_NONE - see
+ * ucsi_partner_has_usb().
+ */
+
 void ucsi_notify_common(struct ucsi *ucsi, u32 cci)
 {
 	/* Ignore bogus data in CCI if busy indicator is set. */
@@ -1334,6 +1344,16 @@ static bool ucsi_partner_has_usb(struct ucsi_connector *con)
 
 	if (UCSI_CONSTAT(con, PARTNER_FLAG_USB))
 		return true;
+
+	/*
+	 * Y700: a power-only charger reports no USB flag while the tablet sinks
+	 * power from it (PWR_DIR clear). Treat it as non-USB so it does not claim
+	 * the shared DWC3 (as USB_ROLE_HOST/DEVICE) and starve the short-edge
+	 * gamepad. Only power-source partners are affected, so non-PD peripherals
+	 * that the tablet powers (PWR_DIR set) keep their host role.
+	 */
+	if (!UCSI_CONSTAT(con, PWR_DIR))
+		return false;
 
 	partner_type = UCSI_CONSTAT(con, PARTNER_TYPE);
 	if (partner_type == UCSI_CONSTAT_PARTNER_TYPE_UFP ||
