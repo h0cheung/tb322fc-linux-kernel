@@ -533,17 +533,19 @@ static int dwc3_mux_role_set(struct usb_role_switch *sw, enum usb_role role)
 	else
 		selected = 0;
 	selected_role = mux->ports[selected].role;
-	if (selected == mux->desired_port && selected_role == mux->desired_role) {
-		ret = 0;
-		goto out;
-	}
-
 	if (selected_role == USB_ROLE_HOST ||
 	    (selected_role == USB_ROLE_NONE &&
 	     dwc->role_switch_default_mode == USB_DR_MODE_HOST))
 		mode = DWC3_GCTL_PRTCAP_HOST;
 	else
 		mode = DWC3_GCTL_PRTCAP_DEVICE;
+
+	if (selected == mux->desired_port && selected_role == mux->desired_role &&
+	    mux->active_port == selected && dwc->current_dr_role == mode &&
+	    !READ_ONCE(mux->error)) {
+		ret = 0;
+		goto out;
+	}
 
 	spin_lock_irqsave(&dwc->lock, flags);
 	mux->desired_port = selected;
