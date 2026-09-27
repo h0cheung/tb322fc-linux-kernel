@@ -682,18 +682,40 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	probe_data.res = &res;
 	probe_data.ignore_clocks_and_resets = true;
 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
+	/*
+	 * Y700: the glue gates GCC_USB30_PRIM_MASTER_CLK in
+	 * dwc3_qcom_suspend() and the DWC3/xHC registers are not
+	 * retention-capable with the master clock gated, so the controller
+	 * loses state across s2idle. Mark it as needing a full re-init: the
+	 * core is then powered down on system suspend (dwc3_core_exit) and
+	 * rebuilt from scratch on resume. Without this the HOST resume takes
+	 * the "fast path" (no re-init) and the xHC either issues a stale DMA
+	 * (arm-smmu context fault, gamepad fails to enumerate) or cannot
+	 * complete its own reset.
+	 */
+	probe_data.properties.needs_full_reinit = true;
+
+	wakeup_source = of_property_read_bool(dev->of_node, "wakeup-source");
+	/*
+	 * Y700: the controller is powered down on system suspend
+	 * (needs_full_reinit), so it cannot generate a wakeup. Leaving it
+	 * marked as a wakeup source makes the resume fail: at xhci_resume
+	 * entry USBSTS.CNR is already set and the xHC reset then never
+	 * completes ("CNR never cleared" -> -110). Keep it non-wakeup.
+	 */
+	if (probe_data.properties.needs_full_reinit)
+		wakeup_source = false;
+	device_init_wakeup(&pdev->dev, wakeup_source);
+
 	ret = dwc3_core_probe(&probe_data);
 	if (ret)  {
 		ret = dev_err_probe(dev, ret, "failed to register DWC3 Core\n");
-		goto clk_disable;
+		goto disable_wakeup;
 	}
 
 	ret = dwc3_qcom_interconnect_init(qcom);
 	if (ret)
 		goto remove_core;
-
-	wakeup_source = of_property_read_bool(dev->of_node, "wakeup-source");
-	device_init_wakeup(&pdev->dev, wakeup_source);
 
 	qcom->is_suspended = false;
 
@@ -701,6 +723,8 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 
 remove_core:
 	dwc3_core_remove(&qcom->dwc);
+disable_wakeup:
+	device_init_wakeup(&pdev->dev, false);
 clk_disable:
 	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
 
@@ -715,6 +739,7 @@ static void dwc3_qcom_remove(struct platform_device *pdev)
 	if (pm_runtime_resume_and_get(qcom->dev) < 0)
 		return;
 
+	device_init_wakeup(&pdev->dev, false);
 	dwc3_core_remove(&qcom->dwc);
 	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
 	dwc3_qcom_interconnect_exit(qcom);
