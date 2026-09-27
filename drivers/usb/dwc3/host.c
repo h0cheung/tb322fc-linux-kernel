@@ -18,6 +18,24 @@
 #include "../host/xhci-caps.h"
 #include "../host/xhci-plat.h"
 #include "core.h"
+#include "io.h"
+
+#ifndef XHCI_RESET_ON_RESUME
+#define XHCI_RESET_ON_RESUME	BIT_ULL(7)
+#endif
+
+/*
+ * Y700: xhci_resume() must reset the xHC, not restore it.
+ *
+ * Leaving the reset off lets xhci_resume() take the "state intact" path,
+ * which resumes in ~1.6 s with WiFi up but leaves the attached device unable
+ * to enumerate (-108) and the xHC stops responding shortly after. The reset
+ * is required, not optional: dwc3_qcom marks the controller needs_full_reinit,
+ * so it is powered down (dwc3_core_exit) on system suspend and rebuilt from
+ * scratch on resume; the state-intact path would restore stale rings into a
+ * fresh core. With the core properly power-cycled the reset completes cleanly
+ * and the attached device re-enumerates.
+ */
 
 #define XHCI_HCSPARAMS1		0x4
 #define XHCI_PORTSC_BASE	0x400
@@ -196,7 +214,12 @@ int dwc3_host_init(struct dwc3 *dwc)
 		}
 	}
 
-	ret = platform_device_add_data(xhci, &dwc3_xhci_plat_quirk,
+	struct xhci_plat_priv plat_priv = dwc3_xhci_plat_quirk;
+
+	plat_priv.quirks |= XHCI_RESET_ON_RESUME;
+	plat_priv.power_lost = true;
+
+	ret = platform_device_add_data(xhci, &plat_priv,
 				       sizeof(struct xhci_plat_priv));
 	if (ret)
 		goto err;
@@ -206,6 +229,15 @@ int dwc3_host_init(struct dwc3 *dwc)
 		dev_err(dwc->dev, "failed to register xHCI device\n");
 		goto err;
 	}
+
+	if (!xhci->dev.driver) {
+		dev_err(dwc->dev, "failed to probe xHCI device\n");
+		platform_device_del(xhci);
+		ret = -ENODEV;
+		goto err;
+	}
+
+	device_disable_async_suspend(&xhci->dev);
 
 	if (dwc->sys_wakeup) {
 		/* Restore wakeup setting if switched from device */

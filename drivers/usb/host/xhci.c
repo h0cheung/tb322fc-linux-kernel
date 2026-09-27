@@ -38,6 +38,7 @@ module_param(link_quirk, int, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(link_quirk, "Don't clear the chain bit on a link TRB");
 
 static unsigned long long quirks;
+
 module_param(quirks, ullong, S_IRUGO);
 MODULE_PARM_DESC(quirks, "Bit flags for quirks to be enabled as default");
 
@@ -192,11 +193,8 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
 		return -ENODEV;
 	}
 
-	if ((state & STS_HALT) == 0) {
-		xhci_warn(xhci, "Host controller not halted, aborting reset.\n");
-		return 0;
-	}
-
+	if ((state & STS_HALT) == 0)
+		xhci_warn(xhci, "Host controller not halted, forcing reset per spec.\n");
 	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "// Reset the HC");
 	command = readl(&xhci->op_regs->command);
 	command |= CMD_RESET;
@@ -5471,6 +5469,19 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
 	if (xhci->hci_version > 0x100)
 		xhci->hcc_params2 = readl(&xhci->cap_regs->hcc_params2);
 
+	/*
+	 * Y700: the DWC3 core loses its state across s2idle (the qcom glue
+	 * gates the USB clocks). If the core is not up when the xHCI platform
+	 * device is probed, the CAP registers read back as 0 and the rest of
+	 * setup walks bogus state (NULL deref in xhci_mem_init). Fail the probe
+	 * cleanly instead of taking down the kernel.
+	 */
+	if (!xhci->hci_version || !hcs_params1) {
+		xhci_err(xhci, "xHC inaccessible (hci_version=%#x hcs_params1=%#x)\n",
+			 xhci->hci_version, hcs_params1);
+		return -ENODEV;
+	}
+
 	xhci->dma_mask_bits = 64;
 	xhci->max_slots = min(HCS_MAX_SLOTS(hcs_params1), MAX_HC_SLOTS);
 	xhci->max_ports = min(HCS_MAX_PORTS(hcs_params1), MAX_HC_PORTS);
@@ -5497,10 +5508,10 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
 		xhci->quirks |= XHCI_LINK_TRB_QUIRK;
 	}
 
-	/* Make sure the HC is halted. */
+	/* Make sure the HC is halted. If halt fails (e.g. host error), force reset per spec */
 	retval = xhci_halt(xhci);
 	if (retval)
-		return retval;
+		xhci_warn(xhci, "HC halt timed out (%d), attempting reset\n", retval);
 
 	xhci_zero_64b_regs(xhci);
 

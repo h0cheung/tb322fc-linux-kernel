@@ -157,51 +157,14 @@ void dwc3_set_prtcap(struct dwc3 *dwc, u32 mode, bool ignore_susphy)
 	reg &= ~(DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG));
 	reg |= DWC3_GCTL_PRTCAPDIR(mode);
 	dwc3_writel(dwc, DWC3_GCTL, reg);
+	dwc3_readl(dwc, DWC3_GCTL);
 
 	dwc->current_dr_role = mode;
 	trace_dwc3_set_prtcap(dwc, mode);
 }
 EXPORT_SYMBOL_GPL(dwc3_set_prtcap);
 
-/* Removal callbacks cannot report halt errors. Do not reroute a running core. */
-static int dwc3_check_halted(struct dwc3 *dwc)
-{
-	struct resource *res = &dwc->xhci_resources[0];
-	void __iomem *base;
-	u32 reg, offset, command;
 
-	switch (dwc->current_dr_role) {
-	case DWC3_GCTL_PRTCAP_HOST:
-		if (res->flags & IORESOURCE_MEM_NONPOSTED)
-			base = ioremap_np(res->start, resource_size(res));
-		else
-			base = ioremap(res->start, resource_size(res));
-		if (!base)
-			return -ENOMEM;
-		reg = readl(base);
-		offset = XHCI_HC_LENGTH(reg);
-		if (reg == U32_MAX || !offset) {
-			iounmap(base);
-			return -EIO;
-		}
-		reg = readl(base + offset + XHCI_STS_OFFSET);
-		command = readl(base + offset + XHCI_CMD_OFFSET);
-		iounmap(base);
-		if (reg == U32_MAX || command == U32_MAX)
-			return -EIO;
-		if (!(reg & XHCI_STS_HALT) || (reg & XHCI_STS_CNR) ||
-		    (command & (XHCI_CMD_RUN | XHCI_CMD_RESET)))
-			return -EBUSY;
-		return 0;
-	case DWC3_GCTL_PRTCAP_DEVICE:
-		reg = dwc3_readl(dwc, DWC3_DSTS);
-		if (reg == U32_MAX)
-			return -EIO;
-		return reg & DWC3_DSTS_DEVCTRLHLT ? 0 : -EBUSY;
-	default:
-		return 0;
-	}
-}
 
 static void __dwc3_set_mode(struct work_struct *work)
 {
@@ -237,10 +200,20 @@ static void __dwc3_set_mode(struct work_struct *work)
 	if (!desired_dr_role)
 		goto out;
 
-	if (desired_dr_role == dwc->current_dr_role &&
-	    (!mux || mux_port == mux->active_port)) {
-		if (mux)
+	if (desired_dr_role == dwc->current_dr_role) {
+		if (mux && mux_port != mux->active_port) {
 			ret = dwc3_pre_set_role(dwc, mux_role);
+			if (ret)
+				goto mode_failed;
+			ret = gpiod_direction_output(mux->select, mux_port);
+			if (ret)
+				goto mode_failed;
+			spin_lock_irqsave(&dwc->lock, flags);
+			mux->active_port = mux_port;
+			spin_unlock_irqrestore(&dwc->lock, flags);
+		} else if (mux) {
+			ret = dwc3_pre_set_role(dwc, mux_role);
+		}
 		goto out;
 	}
 
@@ -254,6 +227,7 @@ static void __dwc3_set_mode(struct work_struct *work)
 	case DWC3_GCTL_PRTCAP_DEVICE:
 		dwc3_gadget_exit(dwc);
 		dwc3_event_buffers_cleanup(dwc);
+		dwc3_core_soft_reset(dwc);
 		break;
 	case DWC3_GCTL_PRTCAP_OTG:
 		dwc3_otg_exit(dwc);
@@ -276,9 +250,7 @@ static void __dwc3_set_mode(struct work_struct *work)
 	 * When current_dr_role is not set, there's no role switching.
 	 * Only perform GCTL.CoreSoftReset when there's DRD role switching.
 	 */
-	if (dwc->current_dr_role && ((DWC3_IP_IS(DWC3) ||
-			DWC3_VER_IS_PRIOR(DWC31, 190A)) &&
-			desired_dr_role != DWC3_GCTL_PRTCAP_OTG)) {
+	if (dwc->current_dr_role && desired_dr_role != DWC3_GCTL_PRTCAP_OTG) {
 		reg = dwc3_readl(dwc, DWC3_GCTL);
 		reg |= DWC3_GCTL_CORESOFTRESET;
 		dwc3_writel(dwc, DWC3_GCTL, reg);
@@ -314,6 +286,20 @@ static void __dwc3_set_mode(struct work_struct *work)
 
 	switch (desired_dr_role) {
 	case DWC3_GCTL_PRTCAP_HOST:
+		msleep(20);
+
+		for (i = 0; i < dwc->num_usb2_ports; i++) {
+			reg = dwc3_readl(dwc, DWC3_GUSB2PHYCFG(i));
+			reg |= DWC3_GUSB2PHYCFG_PHYSOFTRST;
+			dwc3_writel(dwc, DWC3_GUSB2PHYCFG(i), reg);
+		}
+		udelay(20);
+		for (i = 0; i < dwc->num_usb2_ports; i++) {
+			reg = dwc3_readl(dwc, DWC3_GUSB2PHYCFG(i));
+			reg &= ~DWC3_GUSB2PHYCFG_PHYSOFTRST;
+			dwc3_writel(dwc, DWC3_GUSB2PHYCFG(i), reg);
+		}
+
 		for (i = 0; i < dwc->num_usb2_ports; i++) {
 			ret = phy_set_mode(dwc->usb2_generic_phy[i], PHY_MODE_USB_HOST);
 			if (ret)
@@ -382,7 +368,6 @@ record_error:
 		WRITE_ONCE(mux->error, ret);
 		dev_err(dwc->dev, "connector handover failed: %d\n", ret);
 	}
-unlock:
 	mutex_unlock(&dwc->mutex);
 }
 
@@ -2598,7 +2583,7 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 		break;
 	case DWC3_GCTL_PRTCAP_HOST:
 		if (!PMSG_IS_AUTO(msg) &&
-		    (!device_may_wakeup(dwc->dev) || dwc->needs_full_reinit)) {
+		    (!device_may_wakeup(dwc->sysdev) || dwc->needs_full_reinit)) {
 			dwc3_core_exit(dwc);
 			break;
 		}
@@ -2645,6 +2630,60 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 	return 0;
 }
 
+/*
+ * Y700: the DWC3 core has to be reset before it is re-initialised after
+ * s2idle. __dwc3_set_mode() holds GCTL.CORESOFTRESET for 100 ms because
+ * DWC_usb31/32 "may need at least 50ms" for the internal clocks to
+ * synchronise; pulsing it for only 10 ms leaves the core mid-reset, so the
+ * xHC never comes up halted and xhci_reset()'s HCRST handshake never
+ * completes.
+ */
+static void dwc3_core_reset_for_resume(struct dwc3 *dwc)
+{
+	u32 reg;
+
+	reg = dwc3_readl(dwc, DWC3_GCTL);
+	reg |= DWC3_GCTL_CORESOFTRESET;
+	dwc3_writel(dwc, DWC3_GCTL, reg);
+	msleep(100);
+	reg = dwc3_readl(dwc, DWC3_GCTL);
+	reg &= ~DWC3_GCTL_CORESOFTRESET;
+	dwc3_writel(dwc, DWC3_GCTL, reg);
+	udelay(20);
+}
+
+/* Re-apply the host PHY bring-up __dwc3_set_mode() does before dwc3_host_init(). */
+static void dwc3_host_phy_reinit(struct dwc3 *dwc)
+{
+	u32 reg;
+	int i, ret;
+
+	dwc3_set_prtcap(dwc, DWC3_GCTL_PRTCAP_HOST, true);
+	msleep(20);
+
+	for (i = 0; i < dwc->num_usb2_ports; i++) {
+		reg = dwc3_readl(dwc, DWC3_GUSB2PHYCFG(i));
+		reg |= DWC3_GUSB2PHYCFG_PHYSOFTRST;
+		dwc3_writel(dwc, DWC3_GUSB2PHYCFG(i), reg);
+	}
+	udelay(20);
+	for (i = 0; i < dwc->num_usb2_ports; i++) {
+		reg = dwc3_readl(dwc, DWC3_GUSB2PHYCFG(i));
+		reg &= ~DWC3_GUSB2PHYCFG_PHYSOFTRST;
+		dwc3_writel(dwc, DWC3_GUSB2PHYCFG(i), reg);
+	}
+	for (i = 0; i < dwc->num_usb2_ports; i++) {
+		ret = phy_set_mode(dwc->usb2_generic_phy[i], PHY_MODE_USB_HOST);
+		if (ret)
+			dev_err(dwc->dev, "host resume: usb2 phy_set_mode ret=%d\n", ret);
+	}
+	for (i = 0; i < dwc->num_usb3_ports; i++) {
+		ret = phy_set_mode(dwc->usb3_generic_phy[i], PHY_MODE_USB_HOST);
+		if (ret)
+			dev_err(dwc->dev, "host resume: usb3 phy_set_mode ret=%d\n", ret);
+	}
+}
+
 static int dwc3_resume_common(struct dwc3 *dwc, pm_message_t msg)
 {
 	int		ret;
@@ -2662,13 +2701,50 @@ static int dwc3_resume_common(struct dwc3 *dwc, pm_message_t msg)
 		break;
 	case DWC3_GCTL_PRTCAP_HOST:
 		if (!PMSG_IS_AUTO(msg) &&
-		    (!device_may_wakeup(dwc->dev) || dwc->needs_full_reinit)) {
+		    (!device_may_wakeup(dwc->sysdev) || dwc->needs_full_reinit)) {
+			/*
+			 * The controller does not retain its state across system
+			 * suspend on this platform (the glue gates its clocks), so
+			 * restore the core here before xhci_resume() runs. The xHC
+			 * is reset on resume, which requires a live core.
+			 *
+			 * The HOST fast-path suspend also drops the PHY providers'
+			 * runtime PM references (phy_pm_runtime_put_sync), so
+			 * re-acquire them before touching the PHYs/core. Without the
+			 * matching get_sync() the refcount leaks on every system
+			 * suspend: once the QMP PHY provider runtime-suspends it
+			 * gates the PIPE clock (and enables autonomous mode), and
+			 * xhci_reset()'s HCRST handshake then never completes, so
+			 * PM resume fails with -110. Skip this when suspend powered
+			 * the core down through dwc3_core_exit(), where the PHY refs
+			 * were not dropped.
+			 */
+			if (device_may_wakeup(dwc->sysdev) && !dwc->needs_full_reinit) {
+				for (i = 0; i < dwc->num_usb2_ports; i++)
+					phy_pm_runtime_get_sync(dwc->usb2_generic_phy[i]);
+				for (i = 0; i < dwc->num_usb3_ports; i++)
+					phy_pm_runtime_get_sync(dwc->usb3_generic_phy[i]);
+			}
+
+			dwc3_core_reset_for_resume(dwc);
+
 			ret = dwc3_core_init_for_resume(dwc);
 			if (ret)
 				return ret;
-			dwc3_set_prtcap(dwc, DWC3_GCTL_PRTCAP_HOST, true);
+
+			dwc3_host_phy_reinit(dwc);
 			break;
 		}
+		/*
+		 * The fast path deliberately does not re-init the core, so it must
+		 * at least make sure the core is still routed to the host block.
+		 * Anything that reset the core behind our back (the glue's BCR
+		 * pulse, a power collapse) reverts GCTL.PRTCAPDIR to its reset
+		 * default, and with PRTCAPDIR != HOST the xHC is not connected to
+		 * the PHY at all: it then refuses to halt and xhci_reset()'s HCRST
+		 * handshake never completes (PM resume fails with -110).
+		 */
+		dwc3_set_prtcap(dwc, DWC3_GCTL_PRTCAP_HOST, true);
 		/* Restore GUSB2PHYCFG bits that were modified in suspend */
 		for (i = 0; i < dwc->num_usb2_ports; i++) {
 			reg = dwc3_readl(dwc, DWC3_GUSB2PHYCFG(i));
@@ -2714,6 +2790,11 @@ static int dwc3_resume_common(struct dwc3 *dwc, pm_message_t msg)
 		/* restore SUSPHY state to that before system suspend. */
 		dwc3_enable_susphy(dwc, dwc->susphy_state);
 	}
+
+	/* The port-select mux may have been re-driven as an output by the
+	 * role switch; make sure it still selects the active connector. */
+	if (dwc->role_mux && dwc->role_mux->select && dwc->role_mux->active_port >= 0)
+		gpiod_direction_output(dwc->role_mux->select, dwc->role_mux->active_port);
 
 	return 0;
 }
@@ -2837,6 +2918,9 @@ int dwc3_pm_resume(struct dwc3 *dwc)
 	int		ret = 0;
 
 	pinctrl_pm_select_default_state(dev);
+
+	if (dwc->role_mux && dwc->role_mux->select && dwc->role_mux->active_port >= 0)
+		gpiod_direction_output(dwc->role_mux->select, dwc->role_mux->active_port);
 
 	pm_runtime_disable(dev);
 	ret = pm_runtime_set_active(dev);
