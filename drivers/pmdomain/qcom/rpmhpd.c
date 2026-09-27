@@ -125,6 +125,13 @@ static struct rpmhpd gfx = {
 	.presync_floor = true,
 };
 
+static struct rpmhpd gfx_gmu = {
+	.pd = { .name = "gfx", },
+	.res_name = "gfx.lvl",
+	.presync_floor = true,
+	.skip_retention_level = true,
+};
+
 static struct rpmhpd gfx1 = {
 	.pd = { .name = "gfx1", },
 	.res_name = "gfx1.lvl",
@@ -239,6 +246,13 @@ static struct rpmhpd gmxc = {
 	.pd = { .name = "gmxc", },
 	.res_name = "gmxc.lvl",
 	.presync_floor = true,
+};
+
+static struct rpmhpd gmxc_sm8750 = {
+	.pd = { .name = "gmxc", },
+	.res_name = "gmxc.lvl",
+	.presync_floor = true,
+	.skip_retention_level = true,
 };
 
 /* Eliza RPMH powerdomains */
@@ -648,8 +662,8 @@ static struct rpmhpd *sm8750_rpmhpds[] = {
 	[RPMHPD_CX] = &cx,
 	[RPMHPD_CX_AO] = &cx_ao,
 	[RPMHPD_EBI] = &ebi,
-	[RPMHPD_GFX] = &gfx,
-	[RPMHPD_GMXC] = &gmxc,
+	[RPMHPD_GFX] = &gfx_gmu,
+	[RPMHPD_GMXC] = &gmxc_sm8750,
 	[RPMHPD_LCX] = &lcx,
 	[RPMHPD_LMX] = &lmx,
 	[RPMHPD_MX] = &mx,
