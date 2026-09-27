@@ -523,8 +523,12 @@ static int gdsc_init(struct gdsc *sc)
 
 	if (sc->flags & ALWAYS_ON)
 		sc->pd.flags |= GENPD_FLAG_ALWAYS_ON;
-	if (!sc->pd.power_off)
-		sc->pd.power_off = gdsc_disable;
+	if (!sc->pd.power_off) {
+		if (sc->pd.power_on == gdsc_gx_do_nothing_enable)
+			sc->pd.power_off = gdsc_gx_do_nothing_disable;
+		else
+			sc->pd.power_off = gdsc_disable;
+	}
 	if (!sc->pd.power_on)
 		sc->pd.power_on = gdsc_enable;
 	if (sc->flags & HW_CTRL_TRIGGER) {
@@ -727,3 +731,18 @@ int gdsc_gx_do_nothing_enable(struct generic_pm_domain *domain)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(gdsc_gx_do_nothing_enable);
+
+int gdsc_gx_do_nothing_disable(struct generic_pm_domain *domain)
+{
+	struct gdsc *sc = domain_to_gdsc(domain);
+	int ret = 0;
+
+	/* Disable the parent supply, when controlled through the regulator framework. */
+	if (sc->rsupply)
+		ret = regulator_disable(sc->rsupply);
+
+	/* Do nothing with the GDSC itself */
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(gdsc_gx_do_nothing_disable);
