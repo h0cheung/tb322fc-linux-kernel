@@ -2583,6 +2583,20 @@ static const struct snd_soc_dapm_widget wcd939x_dapm_widgets[] = {
 	SND_SOC_DAPM_MIC("Analog Mic4", NULL),
 	SND_SOC_DAPM_MIC("Analog Mic5", NULL),
 
+	/*
+	 * DMIC widgets have no source-side input without these, so DAPM
+	 * cannot power the DMIC -> TX SoundWire capture path on boards
+	 * with WCD digital microphones.
+	 */
+	SND_SOC_DAPM_INPUT("DMIC1_IN"),
+	SND_SOC_DAPM_INPUT("DMIC2_IN"),
+	SND_SOC_DAPM_INPUT("DMIC3_IN"),
+	SND_SOC_DAPM_INPUT("DMIC4_IN"),
+	SND_SOC_DAPM_INPUT("DMIC5_IN"),
+	SND_SOC_DAPM_INPUT("DMIC6_IN"),
+	SND_SOC_DAPM_INPUT("DMIC7_IN"),
+	SND_SOC_DAPM_INPUT("DMIC8_IN"),
+
 	/* TX widgets */
 	SND_SOC_DAPM_ADC_E("ADC1", NULL, SND_SOC_NOPM, 0, 0,
 			   wcd939x_codec_enable_adc,
@@ -2828,27 +2842,35 @@ static const struct snd_soc_dapm_route wcd939x_audio_map[] = {
 
 	{"DMIC1_OUTPUT", NULL, "DMIC1_MIXER"},
 	{"DMIC1_MIXER", "Switch", "DMIC1"},
+	{"DMIC1", NULL, "DMIC1_IN"},
 
 	{"DMIC2_OUTPUT", NULL, "DMIC2_MIXER"},
 	{"DMIC2_MIXER", "Switch", "DMIC2"},
+	{"DMIC2", NULL, "DMIC2_IN"},
 
 	{"DMIC3_OUTPUT", NULL, "DMIC3_MIXER"},
 	{"DMIC3_MIXER", "Switch", "DMIC3"},
+	{"DMIC3", NULL, "DMIC3_IN"},
 
 	{"DMIC4_OUTPUT", NULL, "DMIC4_MIXER"},
 	{"DMIC4_MIXER", "Switch", "DMIC4"},
+	{"DMIC4", NULL, "DMIC4_IN"},
 
 	{"DMIC5_OUTPUT", NULL, "DMIC5_MIXER"},
 	{"DMIC5_MIXER", "Switch", "DMIC5"},
+	{"DMIC5", NULL, "DMIC5_IN"},
 
 	{"DMIC6_OUTPUT", NULL, "DMIC6_MIXER"},
 	{"DMIC6_MIXER", "Switch", "DMIC6"},
+	{"DMIC6", NULL, "DMIC6_IN"},
 
 	{"DMIC7_OUTPUT", NULL, "DMIC7_MIXER"},
 	{"DMIC7_MIXER", "Switch", "DMIC7"},
+	{"DMIC7", NULL, "DMIC7_IN"},
 
 	{"DMIC8_OUTPUT", NULL, "DMIC8_MIXER"},
 	{"DMIC8_MIXER", "Switch", "DMIC8"},
+	{"DMIC8", NULL, "DMIC8_IN"},
 
 	/* RX Path */
 	{"IN1_HPHL", NULL, "VDD_BUCK"},
