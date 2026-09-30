@@ -1684,6 +1684,13 @@
 	status = "okay";
 };
 
+/* VPU v3.5 hardware video decode/encode. The node ships disabled upstream
+ * because the IRIS firmware is vendor-signed; the Y700 has the signed
+ * qcom/vpu/vpu35_p4.mbn available, so enable it. */
+&iris {
+	status = "okay";
+};
+
 &mdss {
 	memory-region = <&splash_mem>;
 	/delete-property/ iommus;
