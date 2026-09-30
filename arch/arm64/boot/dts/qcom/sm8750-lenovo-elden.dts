@@ -1916,6 +1916,13 @@
 	status = "okay";
 };
 
+&pmk8550_pon {
+	pmk8550_watchdog: watchdog {
+		compatible = "qcom,pm8916-wdt";
+		timeout-sec = <60>;
+	};
+};
+
 &qupv3_1 {
 	status = "okay";
 };
