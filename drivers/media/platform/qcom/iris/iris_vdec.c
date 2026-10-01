@@ -394,6 +394,23 @@ int iris_vdec_streamon_output(struct iris_inst *inst)
 	const struct iris_hfi_session_ops *hfi_ops = inst->hfi_session_ops;
 	int ret;
 
+	/*
+	 * The client started the CAPTURE queue before the initial source
+	 * change (ffmpeg's v4l2m2m STREAMONs both queues up front).  The vendor
+	 * firmware (vpu35_4v.mbn) then rejects the source-change resume with
+	 * HFI_ERROR_FATAL, so defer all CAPTURE-port HFI work until the source
+	 * change arrives.  It is completed from iris_vdec_start_cmd() when the
+	 * client issues V4L2_DEC_CMD_START (ffmpeg sends that on the
+	 * source-change event), or from a later STREAMON which then takes the
+	 * normal FIRST_IPSC path.
+	 */
+	if (!(inst->sub_state & (IRIS_INST_SUB_FIRST_IPSC | IRIS_INST_SUB_DRC |
+				 IRIS_INST_SUB_DRAIN)) &&
+	    inst->state == IRIS_INST_INPUT_STREAMING) {
+		inst->defer_capture_streamon = true;
+		return 0;
+	}
+
 	ret = hfi_ops->session_set_config_params(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 	if (ret)
 		return ret;
@@ -440,7 +457,8 @@ int iris_vdec_qbuf(struct iris_inst *inst, struct vb2_v4l2_buffer *vbuf)
 		iris_set_ts_metadata(inst, vbuf);
 
 	q = v4l2_m2m_get_vq(inst->m2m_ctx, vb2->type);
-	if (!vb2_is_streaming(q)) {
+	if (!vb2_is_streaming(q) ||
+	    (inst->defer_capture_streamon && buf->type == BUF_OUTPUT)) {
 		buf->attr |= BUF_ATTR_DEFERRED;
 		return 0;
 	}
@@ -474,6 +492,22 @@ int iris_vdec_start_cmd(struct iris_inst *inst)
 	int ret;
 
 	dst_vq = v4l2_m2m_get_dst_vq(inst->m2m_ctx);
+
+	if (inst->defer_capture_streamon) {
+		/*
+		 * The client streamed CAPTURE before the initial source change
+		 * (so the CAPTURE-port bring-up was deferred).  The source
+		 * change has now arrived and put us in the FIRST_IPSC sub-state;
+		 * complete the deferred bring-up here.  This emits the same HFI
+		 * sequence as a normal post-source-change STREAMON, which the
+		 * firmware accepts.
+		 */
+		inst->defer_capture_streamon = false;
+		ret = iris_vdec_streamon_output(inst);
+		if (ret)
+			return ret;
+		return iris_queue_deferred_buffers(inst, BUF_OUTPUT);
+	}
 
 	if (inst->sub_state & IRIS_INST_SUB_DRC &&
 	    inst->sub_state & IRIS_INST_SUB_DRC_LAST) {

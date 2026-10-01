@@ -114,6 +114,12 @@ struct iris_inst {
 	u32				metadata_idx;
 	u32				codec;
 	bool				last_buffer_dequeued;
+	/* Decoder: the client started the CAPTURE queue before the initial
+	 * source change (ffmpeg v4l2m2m does this).  The CAPTURE-port HFI work
+	 * is deferred until the source change arrives, because the vendor
+	 * firmware rejects a capture-port START issued before the initial IPSC.
+	 */
+	bool				defer_capture_streamon;
 	u64				last_buf_ns;
 	u32				frame_counter;
 	u32				frame_rate;
