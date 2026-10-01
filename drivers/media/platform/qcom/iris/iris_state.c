@@ -264,6 +264,11 @@ bool iris_allow_cmd(struct iris_inst *inst, u32 cmd)
 	struct vb2_queue *dst_q = v4l2_m2m_get_dst_vq(inst->m2m_ctx);
 
 	if (cmd == V4L2_DEC_CMD_START || cmd == V4L2_ENC_CMD_START) {
+		/* Decoder: CAPTURE was streamed before the initial source
+		 * change, so its bring-up is deferred and completed by
+		 * iris_vdec_start_cmd() when the client issues START. */
+		if (inst->defer_capture_streamon)
+			return true;
 		if (vb2_is_streaming(src_q) || vb2_is_streaming(dst_q))
 			if (iris_drc_pending(inst) || iris_drain_pending(inst))
 				return true;
