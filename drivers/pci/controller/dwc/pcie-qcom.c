@@ -2224,6 +2224,35 @@ err_pm_runtime_put:
 	return ret;
 }
 
+/*
+ * Use the DT suspend OPP to retain the PCIe DDR/LLCC sleep-set votes
+ * during s2idle. Suspend-to-RAM tears the link down and keeps dropping
+ * the OPP.
+ */
+static int qcom_pcie_set_suspend_opp(struct qcom_pcie *pcie)
+{
+	struct device *dev = pcie->pci->dev;
+	struct dev_pm_opp *opp;
+	unsigned long freq;
+	int ret;
+
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		return dev_pm_opp_set_opp(dev, NULL);
+
+	freq = dev_pm_opp_get_suspend_opp_freq(dev);
+	if (!freq)
+		return dev_pm_opp_set_opp(dev, NULL);
+
+	opp = dev_pm_opp_find_freq_exact(dev, freq, true);
+	if (IS_ERR(opp))
+		return PTR_ERR(opp);
+
+	ret = dev_pm_opp_set_opp(dev, opp);
+	dev_pm_opp_put(opp);
+
+	return ret;
+}
+
 static int qcom_pcie_suspend_noirq(struct device *dev)
 {
 	struct qcom_pcie *pcie;
@@ -2246,8 +2275,11 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
 		if (ret)
 			dev_err(dev, "Failed to disable CPU-PCIe interconnect path: %d\n", ret);
 
-		if (pcie->use_pm_opp)
-			dev_pm_opp_set_opp(pcie->pci->dev, NULL);
+		if (pcie->use_pm_opp) {
+			ret = qcom_pcie_set_suspend_opp(pcie);
+			if (ret)
+				dev_err(dev, "Failed to set suspend OPP: %d\n", ret);
+		}
 	} else {
 		/* The active controller still needs its power domain. */
 		device_set_awake_path(dev);
@@ -2278,8 +2310,12 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
 				dev_err(dev, "Failed to disable CPU-PCIe interconnect path: %d\n",
 					ret);
 
-			if (pcie->use_pm_opp)
-				dev_pm_opp_set_opp(pcie->pci->dev, NULL);
+			if (pcie->use_pm_opp) {
+				ret = qcom_pcie_set_suspend_opp(pcie);
+				if (ret)
+					dev_err(dev, "Failed to set suspend OPP: %d\n",
+						ret);
+			}
 		}
 	}
 	return ret;
