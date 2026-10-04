@@ -129,10 +129,11 @@ static struct fault_info Load128(u64 Addr, u128* Result) {
 
   uaccess_enable_privileged();
   asm volatile("1: ldaxp %[ResultLower], %[ResultUpper], [%[Addr]]\n"
-               "   stlxp %w[Tmp], %[ResultLower], %[ResultUpper], [%[Addr]]\n"
+               "2: stlxp %w[Tmp], %[ResultLower], %[ResultUpper], [%[Addr]]\n"
                "   cbnz %w[Tmp], 1b\n"
-               "2:\n"
-               _ASM_EXTABLE_UACCESS_ERR(1b, 2b, %w[ret])
+               "3:\n"
+               _ASM_EXTABLE_UACCESS_ERR(1b, 3b, %w[ret])
+               _ASM_EXTABLE_UACCESS_ERR(2b, 3b, %w[ret])
                : [Tmp] "=&r"(Tmp), [ResultLower] "=&r"(Lower), [ResultUpper] "=&r"(Upper), [ret] "+r"(ret)
                : [Addr] "r"(Addr)
                : "memory");
