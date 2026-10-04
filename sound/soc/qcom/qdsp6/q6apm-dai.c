@@ -316,6 +316,10 @@ static int q6apm_dai_ack(struct snd_soc_component *component, struct snd_pcm_sub
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 	int i, ret = 0, avail_periods;
 
+	/* SYNC_PTR can get here before prepare has allocated fragments */
+	if (!prtd->graph || prtd->state == Q6APM_STREAM_IDLE)
+		return 0;
+
 	if (q6apm_is_graph_in_push_pull_mode(prtd->graph))
 		return 0;
 
@@ -477,6 +481,9 @@ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 	snd_pcm_uframes_t ptr;
+
+	if (!prtd->graph)
+		return 0;
 
 	if (q6apm_is_graph_in_push_pull_mode(prtd->graph)) {
 		int retries = 10;
