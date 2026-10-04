@@ -1440,13 +1440,80 @@ static struct device_node *parse_gpios(struct device_node *np,
 				       "#gpio-cells");
 }
 
+/*
+ * Old DTs pair 2-cell providers with 4-cell entries (no SID mask). The OF
+ * core tolerates them in of_check_bad_map(); use the same test here.
+ */
+static bool iommu_map_is_legacy(const __be32 *map, int nr_cells)
+{
+	__be32 phandle = map[1];
+	int i;
+
+	if (nr_cells % 4)
+		return false;
+
+	for (i = 0; i < nr_cells; i += 4) {
+		if (map[i + 1] != phandle || map[i + 3] != cpu_to_be32(1))
+			return false;
+	}
+
+	return true;
+}
+
+static int iommu_map_entry_cells(const __be32 *map, int pos, int nr_cells)
+{
+	struct device_node *iommu_np;
+	u32 iommu_cells;
+
+	/* rid-base and phandle must be present to look up the provider */
+	if (pos + 2 > nr_cells)
+		return -EINVAL;
+
+	iommu_np = of_find_node_by_phandle(be32_to_cpu(map[pos + 1]));
+	if (!iommu_np)
+		return -EINVAL;
+
+	if (of_property_read_u32(iommu_np, "#iommu-cells", &iommu_cells))
+		iommu_cells = 1;
+	of_node_put(iommu_np);
+
+	if (iommu_cells > MAX_PHANDLE_ARGS)
+		return -EINVAL;
+
+	return 3 + iommu_cells;
+}
+
 static struct device_node *parse_iommu_maps(struct device_node *np,
 					    const char *prop_name, int index)
 {
+	const __be32 *map;
+	int len, nr_cells, entry_cells, pos = 0, i;
+
 	if (strcmp(prop_name, "iommu-map"))
 		return NULL;
 
-	return of_parse_phandle(np, prop_name, (index * 4) + 1);
+	map = of_get_property(np, prop_name, &len);
+	if (!map)
+		return NULL;
+	nr_cells = len / sizeof(*map);
+
+	/* No fixed stride: each entry may name a provider with its own width. */
+	for (i = 0; i <= index; i++) {
+		entry_cells = iommu_map_entry_cells(map, pos, nr_cells);
+		if (entry_cells < 0)
+			return NULL;
+
+		if (entry_cells == 5 && iommu_map_is_legacy(map, nr_cells))
+			entry_cells = 4;
+
+		if (pos + entry_cells > nr_cells)
+			return NULL;
+
+		if (i < index)
+			pos += entry_cells;
+	}
+
+	return of_parse_phandle(np, prop_name, pos + 1);
 }
 
 static struct device_node *parse_gpio_compat(struct device_node *np,
