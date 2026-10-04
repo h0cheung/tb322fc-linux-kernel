@@ -5849,6 +5849,16 @@
 					opp-peak-kBps = <1969000 1>;
 				};
 
+				/*
+				 * Suspend-only: the synthetic opp-hz and missing opp-level
+				 * keep link-speed matching from selecting it.
+				 */
+				opp-suspend-1 {
+					opp-hz = /bits/ 64 <1>;
+					required-opps = <&rpmhpd_opp_low_svs>;
+					opp-peak-kBps = <1000 1>;
+					opp-suspend;
+				};
 			};
 
 			pcieport0: pcie@0 {
