@@ -340,6 +340,7 @@ struct qcom_battmgr {
 	struct qcom_battmgr_wireless wireless;
 
 	struct work_struct enable_work;
+	struct delayed_work poll_work;
 
 	/*
 	 * @lock is used to prevent concurrent power supply requests to the
@@ -1758,6 +1759,23 @@ out:
 	mutex_unlock(&battmgr->lock);
 }
 
+/*
+ * The ADSP firmware does not push periodic battery updates; the percentage
+ * only moves when something reads sysfs (which triggers a property GET to
+ * the firmware). While a game is running nothing reads the battery, so the
+ * percentage freezes and low-battery warnings never fire.
+ */
+static void qcom_battmgr_poll_work(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
+						    poll_work.work);
+
+	qcom_battmgr_bat_sm8350_update(battmgr, POWER_SUPPLY_PROP_CAPACITY);
+	power_supply_changed(battmgr->bat_psy);
+
+	schedule_delayed_work(&battmgr->poll_work, 30 * HZ);
+}
+
 static void qcom_battmgr_pdr_notify(void *priv, int state)
 {
 	struct qcom_battmgr *battmgr = priv;
@@ -1765,8 +1783,10 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 	if (state == SERVREG_SERVICE_STATE_UP) {
 		battmgr->service_up = true;
 		schedule_work(&battmgr->enable_work);
+		schedule_delayed_work(&battmgr->poll_work, 30 * HZ);
 	} else {
 		battmgr->service_up = false;
+		cancel_delayed_work_sync(&battmgr->poll_work);
 	}
 }
 
@@ -1879,6 +1899,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 
 	ret = devm_work_autocancel(dev, &battmgr->enable_work,
 				   qcom_battmgr_enable_worker);
+	if (ret)
+		return ret;
+	ret = devm_delayed_work_autocancel(dev, &battmgr->poll_work,
+					   qcom_battmgr_poll_work);
 	if (ret)
 		return ret;
 
