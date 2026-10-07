@@ -225,6 +225,7 @@ void ath12k_dp_rx_pdev_reo_cleanup(struct ath12k_base *ab);
 int ath12k_dp_rx_htt_setup(struct ath12k_base *ab);
 int ath12k_dp_rx_alloc(struct ath12k_base *ab);
 void ath12k_dp_rx_free(struct ath12k_base *ab);
+void ath12k_dp_rx_refill_wd_stop(struct ath12k_dp *dp);
 int ath12k_dp_rx_pdev_alloc(struct ath12k_base *ab, int pdev_idx);
 void ath12k_dp_rx_pdev_free(struct ath12k_base *ab, int pdev_idx);
 void ath12k_dp_rx_reo_cmd_list_cleanup(struct ath12k_base *ab);

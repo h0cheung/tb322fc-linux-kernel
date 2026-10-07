@@ -1031,7 +1031,11 @@ static ssize_t ath12k_debugfs_dump_device_dp_stats(struct file *file,
 	struct ath12k_device_dp_stats *device_stats = &dp->device_stats;
 	int len = 0, i, j, ret;
 	struct ath12k *ar;
-	const int size = 4096;
+	const int size = 8192;
+	struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
+	struct hal_srng *srng;
+	size_t free_descs;
+	int num_free;
 	static const char *rxdma_err[HAL_REO_ENTR_RING_RXDMA_ECODE_MAX] = {
 		[HAL_REO_ENTR_RING_RXDMA_ECODE_OVERFLOW_ERR] = "Overflow",
 		[HAL_REO_ENTR_RING_RXDMA_ECODE_MPDU_LEN_ERR] = "MPDU len",
@@ -1199,6 +1203,31 @@ static ssize_t ath12k_debugfs_dump_device_dp_stats(struct file *file,
 
 		len += scnprintf(buf + len, size - len, "\n");
 	}
+
+	srng = &dp->hal->srng_list[rx_ring->refill_buf_ring.ring_id];
+	spin_lock_bh(&srng->lock);
+	num_free = ath12k_hal_srng_src_num_free(ab, srng, true);
+	spin_unlock_bh(&srng->lock);
+	spin_lock_bh(&dp->rx_desc_lock);
+	free_descs = list_count_nodes(&dp->rx_desc_free_list);
+	spin_unlock_bh(&dp->rx_desc_lock);
+
+	len += scnprintf(buf + len, size - len,
+			 "\nRX refill ring: %d of %d free, free descriptors %zu\n",
+			 num_free, rx_ring->bufs_max, free_descs);
+	len += scnprintf(buf + len, size - len,
+			 "replenish alloc fail: %u map fail: %u no desc: %u\n",
+			 device_stats->rx_replenish_alloc_fail,
+			 device_stats->rx_replenish_map_fail,
+			 device_stats->rx_replenish_no_desc);
+	len += scnprintf(buf + len, size - len,
+			 "reap without msdu: %u top-up bufs: %u watchdog runs: %u bufs: %u stalls: %u%s\n",
+			 device_stats->rx_reap_no_msdu,
+			 device_stats->rx_refill_topup_bufs,
+			 device_stats->rx_refill_wd_runs,
+			 device_stats->rx_refill_wd_bufs,
+			 device_stats->rx_refill_wd_stalls,
+			 dp->rx_refill_filling ? " (initial fill)" : "");
 
 	ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
 

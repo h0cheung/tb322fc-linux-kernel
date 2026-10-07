@@ -1123,6 +1123,9 @@ static void ath12k_dp_cleanup(struct ath12k_base *ab)
 	if (!dp->ab)
 		return;
 
+	/* before the rx descriptors go away in ath12k_dp_cc_cleanup() */
+	ath12k_dp_rx_refill_wd_stop(dp);
+
 	ath12k_dp_link_desc_cleanup(ab, dp->link_desc_banks,
 				    HAL_WBM_IDLE_LINK, &dp->wbm_idle_ring);
 
