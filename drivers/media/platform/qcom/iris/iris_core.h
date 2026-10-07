@@ -83,6 +83,7 @@ struct iris_core {
 	struct device				*dev;
 	void __iomem				*reg_base;
 	int					irq;
+	bool					hw_powered;
 	struct v4l2_device			v4l2_dev;
 	struct video_device			*vdev_dec;
 	struct video_device			*vdev_enc;

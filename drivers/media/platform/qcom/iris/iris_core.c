@@ -28,6 +28,9 @@ void iris_core_deinit(struct iris_core *core)
 	}
 	mutex_unlock(&core->lock);
 
+	/* let a handler that was waiting for core->lock finish */
+	synchronize_irq(core->irq);
+
 	if (!ret)
 		pm_runtime_put_sync(core->dev);
 }
