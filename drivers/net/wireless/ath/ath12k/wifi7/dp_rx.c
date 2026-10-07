@@ -789,9 +789,9 @@ try_again:
 
 	spin_unlock_bh(&srng->lock);
 
-	if (!total_msdu_reaped)
-		goto exit;
-
+	/* Post the reaped buffers back even if no complete MSDU was reaped,
+	 * or they are lost.
+	 */
 	for (device_id = 0; device_id < ATH12K_MAX_DEVICES; device_id++) {
 		if (!num_buffs_reaped[device_id])
 			continue;
@@ -802,6 +802,14 @@ try_again:
 		ath12k_dp_rx_bufs_replenish(partner_dp, rx_ring,
 					    &rx_desc_used_list[device_id],
 					    num_buffs_reaped[device_id]);
+
+		if (!total_msdu_reaped)
+			dp->device_stats.rx_reap_no_msdu++;
+	}
+
+	if (!total_msdu_reaped) {
+		__skb_queue_purge(&msdu_list);
+		goto exit;
 	}
 
 	ath12k_wifi7_dp_rx_process_received_packets(dp, napi, &msdu_list,

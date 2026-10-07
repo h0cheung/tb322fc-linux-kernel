@@ -7,6 +7,7 @@
 #include <linux/fips.h>
 #include <linux/ieee80211.h>
 #include <linux/kernel.h>
+#include <linux/ratelimit.h>
 #include <linux/skbuff.h>
 #include "core.h"
 #include "debug.h"
@@ -111,13 +112,30 @@ int ath12k_dp_rx_bufs_replenish(struct ath12k_dp *dp,
 						       num_remain);
 		spin_unlock_bh(&dp->rx_desc_lock);
 		num_remain = req_entries;
+	} else if (num_free - req_entries > rx_ring->bufs_max / 8) {
+		/* Also make up for buffers that were never posted back
+		 * (allocation or mapping failure, a dropped descriptor).
+		 */
+		LIST_HEAD(extra);
+		size_t n;
+
+		spin_lock_bh(&dp->rx_desc_lock);
+		n = ath12k_dp_list_cut_nodes(&extra, &dp->rx_desc_free_list,
+					     num_free - req_entries);
+		spin_unlock_bh(&dp->rx_desc_lock);
+		list_splice_tail(&extra, used_list);
+		req_entries += n;
+		num_remain = req_entries;
+		dp->device_stats.rx_refill_topup_bufs += n;
 	}
 
 	while (num_remain > 0) {
 		skb = dev_alloc_skb(DP_RX_BUFFER_SIZE +
 				    DP_RX_BUFFER_ALIGN_SIZE);
-		if (!skb)
+		if (!skb) {
+			dp->device_stats.rx_replenish_alloc_fail++;
 			break;
+		}
 
 		if (!IS_ALIGNED((unsigned long)skb->data,
 				DP_RX_BUFFER_ALIGN_SIZE)) {
@@ -129,14 +147,18 @@ int ath12k_dp_rx_bufs_replenish(struct ath12k_dp *dp,
 		paddr = dma_map_single(dp->dev, skb->data,
 				       skb->len + skb_tailroom(skb),
 				       DMA_FROM_DEVICE);
-		if (dma_mapping_error(dp->dev, paddr))
+		if (dma_mapping_error(dp->dev, paddr)) {
+			dp->device_stats.rx_replenish_map_fail++;
 			goto fail_free_skb;
+		}
 
 		rx_desc = list_first_entry_or_null(used_list,
 						   struct ath12k_rx_desc_info,
 						   list);
-		if (!rx_desc)
+		if (!rx_desc) {
+			dp->device_stats.rx_replenish_no_desc++;
 			goto fail_dma_unmap;
+		}
 
 		rx_desc->skb = skb;
 		cookie = rx_desc->cookie;
@@ -163,6 +185,7 @@ fail_free_skb:
 	dev_kfree_skb_any(skb);
 out:
 	ath12k_hal_srng_access_end(ab, srng);
+	dp->rx_refill_posted += req_entries - num_remain;
 
 	if (!list_empty(used_list))
 		ath12k_dp_rx_enqueue_free(dp, used_list);
@@ -172,6 +195,83 @@ out:
 	return req_entries - num_remain;
 }
 EXPORT_SYMBOL(ath12k_dp_rx_bufs_replenish);
+
+#define ATH12K_DP_RX_REFILL_WD_MS	1000
+
+/* The refill ring is only replenished from the reap paths, and WCN7850 has
+ * no host2rxdma low-threshold interrupt: once the ring runs dry nothing is
+ * reaped any more. Top it up from a timer, which also completes the initial
+ * fill from the descriptor pool.
+ */
+static void ath12k_dp_rx_refill_wd(struct timer_list *t)
+{
+	struct ath12k_dp *dp = timer_container_of(dp, t, rx_refill_wd);
+	struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
+	struct ath12k_device_dp_stats *stats = &dp->device_stats;
+	struct ath12k_base *ab = dp->ab;
+	struct hal_srng *srng;
+	LIST_HEAD(list);
+	int num_free, n;
+	bool reaped;
+	u32 posted;
+
+	if (!test_bit(ATH12K_FLAG_EXT_IRQ_ENABLED, &ab->dev_flags) ||
+	    test_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags) ||
+	    test_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags))
+		goto rearm;
+
+	srng = &dp->hal->srng_list[rx_ring->refill_buf_ring.ring_id];
+	spin_lock_bh(&srng->lock);
+	num_free = ath12k_hal_srng_src_num_free(ab, srng, true);
+	posted = dp->rx_refill_posted;
+	spin_unlock_bh(&srng->lock);
+
+	/* whatever was posted since the last run came from a reap path */
+	reaped = posted != dp->rx_refill_wd_posted;
+	dp->rx_refill_wd_posted = posted;
+
+	if (dp->rx_refill_filling &&
+	    (s32)(posted - dp->rx_refill_fill_end) >= 0)
+		dp->rx_refill_filling = false;
+
+	if (num_free <= rx_ring->bufs_max / (dp->rx_refill_filling ? 8 : 2))
+		goto rearm;
+
+	n = ath12k_dp_rx_bufs_replenish(dp, rx_ring, &list, num_free);
+	dp->rx_refill_wd_posted += n;
+	stats->rx_refill_wd_runs++;
+	stats->rx_refill_wd_bufs += n;
+
+	/* Quiet during the initial fill. After it, a ring that runs low while
+	 * buffers are still reaped is only busy, and one that cannot be
+	 * refilled holds the whole pool already.
+	 */
+	if (dp->rx_refill_filling || reaped || !n)
+		goto rearm;
+
+	stats->rx_refill_wd_stalls++;
+	if (__ratelimit(&dp->rx_refill_wd_rs))
+		ath12k_warn(ab, "rx refill ring ran low with nothing reaped for %u ms: %d of %d free, posted %d (alloc fail %u, map fail %u, no desc %u, stalls %u)\n",
+			    ATH12K_DP_RX_REFILL_WD_MS, num_free,
+			    rx_ring->bufs_max, n,
+			    stats->rx_replenish_alloc_fail,
+			    stats->rx_replenish_map_fail,
+			    stats->rx_replenish_no_desc,
+			    stats->rx_refill_wd_stalls);
+
+rearm:
+	mod_timer(&dp->rx_refill_wd,
+		  jiffies + msecs_to_jiffies(ATH12K_DP_RX_REFILL_WD_MS));
+}
+
+void ath12k_dp_rx_refill_wd_stop(struct ath12k_dp *dp)
+{
+	if (!dp->rx_refill_wd_init)
+		return;
+
+	timer_shutdown_sync(&dp->rx_refill_wd);
+	dp->rx_refill_wd_init = false;
+}
 
 static int ath12k_dp_rxdma_mon_buf_ring_free(struct ath12k_base *ab,
 					     struct dp_rxdma_mon_ring *rx_ring)
@@ -1592,6 +1692,7 @@ void ath12k_dp_rx_free(struct ath12k_base *ab)
 	struct dp_srng *srng;
 	int i;
 
+	ath12k_dp_rx_refill_wd_stop(dp);
 	ath12k_dp_srng_cleanup(ab, &dp->rx_refill_buf_ring.refill_buf_ring);
 
 	for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++) {
@@ -1760,11 +1861,20 @@ int ath12k_dp_rx_alloc(struct ath12k_base *ab)
 		}
 	}
 
+	dp->rx_refill_fill_end = dp->rx_refill_posted + ATH12K_RX_DESC_COUNT(ab);
 	ret = ath12k_dp_rxdma_buf_setup(ab);
 	if (ret) {
 		ath12k_warn(ab, "failed to setup rxdma ring\n");
 		return ret;
 	}
+
+	ratelimit_state_init(&dp->rx_refill_wd_rs, 60 * HZ, 1);
+	dp->rx_refill_wd_posted = dp->rx_refill_posted;
+	dp->rx_refill_filling = true;
+	timer_setup(&dp->rx_refill_wd, ath12k_dp_rx_refill_wd, TIMER_DEFERRABLE);
+	dp->rx_refill_wd_init = true;
+	mod_timer(&dp->rx_refill_wd,
+		  jiffies + msecs_to_jiffies(ATH12K_DP_RX_REFILL_WD_MS));
 
 	return 0;
 }

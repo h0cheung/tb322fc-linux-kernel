@@ -449,6 +449,15 @@ struct ath12k_device_dp_stats {
 	u32 tx_enqueued[DP_TCL_NUM_RING_MAX];
 	u32 tx_completed[DP_TCL_NUM_RING_MAX];
 	u32 reo_excep_msdu_buf_type;
+	/* RX refill ring accounting */
+	u32 rx_replenish_alloc_fail;
+	u32 rx_replenish_map_fail;
+	u32 rx_replenish_no_desc;
+	u32 rx_reap_no_msdu;
+	u32 rx_refill_topup_bufs;
+	u32 rx_refill_wd_runs;
+	u32 rx_refill_wd_bufs;
+	u32 rx_refill_wd_stalls;
 };
 
 struct ath12k_dp {
@@ -506,6 +515,20 @@ struct ath12k_dp {
 	spinlock_t tx_desc_lock[ATH12K_HW_MAX_QUEUES];
 
 	struct dp_rxdma_ring rx_refill_buf_ring;
+	/* completes the initial fill of rx_refill_buf_ring and tops it up
+	 * when nothing is reaped any more
+	 */
+	struct timer_list rx_refill_wd;
+	struct ratelimit_state rx_refill_wd_rs;
+	/* buffers posted to rx_refill_buf_ring, under its srng lock */
+	u32 rx_refill_posted;
+	/* rx_refill_posted as of the last watchdog run */
+	u32 rx_refill_wd_posted;
+	/* rx_refill_posted at which the initial fill ends */
+	u32 rx_refill_fill_end;
+	bool rx_refill_wd_init;
+	/* the initial fill is still going on */
+	bool rx_refill_filling;
 	struct dp_srng rx_mac_buf_ring[MAX_RXDMA_PER_PDEV];
 	struct dp_srng rxdma_err_dst_ring[MAX_RXDMA_PER_PDEV];
 	struct dp_rxdma_mon_ring rxdma_mon_buf_ring;
