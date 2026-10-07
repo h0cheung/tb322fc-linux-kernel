@@ -215,6 +215,23 @@ int iris_session_streamoff(struct iris_inst *inst, u32 plane)
 		return -EINVAL;
 	}
 
+	/*
+	 * The client streamed CAPTURE before the initial source change, so
+	 * iris_vdec_streamon_output() deferred the CAPTURE-port bring-up and the
+	 * firmware never saw that port.  If the client now tears the queue down,
+	 * there is no port to stop: issuing the HFI STOP would fail and
+	 * iris_kill_session() would take the whole instance down, and
+	 * iris_inst_state_change_streamoff() would find no matching transition
+	 * (the state is still INPUT_STREAMING) and force IRIS_INST_ERROR.
+	 * Drop the deferred state and hand the buffers back instead -- the
+	 * instance stays "OUTPUT streaming", which is what it really is.
+	 */
+	if (buffer_type == BUF_OUTPUT && inst->defer_capture_streamon) {
+		inst->defer_capture_streamon = false;
+		iris_flush_deferred_buffers(inst, buffer_type);
+		return 0;
+	}
+
 	ret = hfi_ops->session_stop(inst, plane);
 	if (ret)
 		goto error;
