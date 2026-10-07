@@ -12,12 +12,14 @@
 #include <linux/cpu.h>
 #include <linux/device.h>
 #include <linux/kernel.h>
+#include <linux/moduleparam.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/psci.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/suspend.h>
 
 #include "cpuidle-psci.h"
 #include "dt_idle_genpd.h"
@@ -29,10 +31,29 @@ struct psci_pd_provider {
 
 static LIST_HEAD(psci_pd_providers);
 
+static bool allow_cluster_off = true;
+module_param(allow_cluster_off, bool, 0644);
+MODULE_PARM_DESC(allow_cluster_off,
+		 "Use the idle states of cluster domains (parents of CPU domains) in runtime idle (default: Y)");
+
+static bool psci_pd_is_cluster(struct generic_pm_domain *pd)
+{
+	struct gpd_link *link;
+
+	link = list_first_entry_or_null(&pd->parent_links, struct gpd_link,
+					parent_node);
+	return link && list_empty(&link->child->parent_links);
+}
+
 static int psci_pd_power_off(struct generic_pm_domain *pd)
 {
 	struct genpd_power_state *state = &pd->states[pd->state_idx];
 	u32 *pd_state;
+
+	/* s2idle needs the cluster states to reach the system domain state. */
+	if (!READ_ONCE(allow_cluster_off) && !idle_should_enter_s2idle() &&
+	    psci_pd_is_cluster(pd))
+		return -EBUSY;
 
 	if (!state->data)
 		return 0;
