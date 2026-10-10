@@ -5,6 +5,7 @@
  * Copyright (c) 2020, Linaro Ltd.
  */
 
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/qrtr.h>
 #include <linux/workqueue.h>
@@ -225,12 +226,19 @@ static int announce_servers(struct sockaddr_qrtr *sq)
 
 	/* Announce the list of servers registered in this node */
 	xa_for_each(&node->servers, index, srv) {
+		int tries = 0;
+
+		/* -EAGAIN: our HELLO has not reached this node yet */
 		ret = service_announce_new(sq, srv);
+		while (ret == -EAGAIN && ++tries <= 100) {
+			msleep(100);
+			ret = service_announce_new(sq, srv);
+		}
 		if (ret < 0) {
 			if (ret == -ENODEV)
 				continue;
 
-			pr_err("failed to announce new service\n");
+			pr_err("failed to announce new service: %d\n", ret);
 			return ret;
 		}
 	}
