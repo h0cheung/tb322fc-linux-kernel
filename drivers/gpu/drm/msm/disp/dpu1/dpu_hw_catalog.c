@@ -428,6 +428,12 @@ static const struct dpu_dspp_sub_blks sdm845_dspp_sblk = {
 static const struct dpu_dspp_sub_blks sm8750_dspp_sblk = {
 	.pcc = {.name = "pcc", .base = 0x1700,
 		.len = 0x90, .version = 0x60000},
+	/* GC 块偏移与 SM8650/SDM845 同（0x17c0）；上游 sm8750 目录里漏了，
+	 * 补上后 CRTC 才会暴露 GAMMA_LUT → Night Light / 色温可用。
+	 * 见 dpu_crtc.c: if (dspp->sblk->gc.base) drm_crtc_enable_color_mgmt(...).
+	 */
+	.gc = {.name = "gc", .base = 0x17c0,
+		.len = 0x40, .version = 0x10008},
 };
 
 /*************************************************************
