@@ -912,6 +912,8 @@ struct audioreach_module_config {
 };
 
 /* Packet Allocation routines */
+void audioreach_set_apm_src_port(uint32_t port);
+uint32_t audioreach_get_apm_src_port(void);
 void *audioreach_alloc_apm_cmd_pkt(int pkt_size, uint32_t opcode, uint32_t
 				    token);
 void audioreach_set_default_channel_mapping(u8 *ch_map, int num_channels);

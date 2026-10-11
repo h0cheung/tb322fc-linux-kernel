@@ -285,9 +285,30 @@ void *audioreach_alloc_cmd_pkt(int payload_size, uint32_t opcode, uint32_t token
 }
 EXPORT_SYMBOL_GPL(audioreach_alloc_cmd_pkt);
 
+/*
+ * APM GPR source port.  Most ADSP firmwares answer the mainline static
+ * client port (GPR_APM_MODULE_IID == 1), but some (e.g. the SM8750 ADSP)
+ * only answer their downstream static client port and silently drop
+ * requests from any other port.  q6apm sets this from the "reg" of the
+ * q6apm DT service node so it can follow the device tree.
+ */
+static uint32_t audioreach_apm_src_port = GPR_APM_MODULE_IID;
+
+void audioreach_set_apm_src_port(uint32_t port)
+{
+	audioreach_apm_src_port = port;
+}
+EXPORT_SYMBOL_GPL(audioreach_set_apm_src_port);
+
+uint32_t audioreach_get_apm_src_port(void)
+{
+	return audioreach_apm_src_port;
+}
+EXPORT_SYMBOL_GPL(audioreach_get_apm_src_port);
+
 void *audioreach_alloc_apm_cmd_pkt(int pkt_size, uint32_t opcode, uint32_t token)
 {
-	return __audioreach_alloc_pkt(pkt_size, opcode, token, GPR_APM_MODULE_IID,
+	return __audioreach_alloc_pkt(pkt_size, opcode, token, audioreach_apm_src_port,
 				       APM_MODULE_INSTANCE_ID, true);
 }
 EXPORT_SYMBOL_GPL(audioreach_alloc_apm_cmd_pkt);

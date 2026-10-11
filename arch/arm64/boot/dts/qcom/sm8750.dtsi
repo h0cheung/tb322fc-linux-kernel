@@ -2349,9 +2349,16 @@
 					#address-cells = <1>;
 					#size-cells = <0>;
 
-					q6apm: service@1 {
+					/*
+					 * The SM8750 ADSP firmware only answers the downstream
+					 * static GPR client ports (APM 3, PRM 7) and silently
+					 * drops requests from any other source port, so the
+					 * q6apm/q6prm drivers take their GPR source port from
+					 * this "reg".
+					 */
+					q6apm: service@3 {
 						compatible = "qcom,q6apm";
-						reg = <GPR_APM_MODULE_IID>;
+						reg = <3>;
 						#sound-dai-cells = <0>;
 						qcom,protection-domain = "avs/audio",
 									 "msm/adsp/audio_pd";
@@ -2368,9 +2375,9 @@
 						};
 					};
 
-					q6prm: service@2 {
+					q6prm: service@7 {
 						compatible = "qcom,q6prm";
-						reg = <GPR_PRM_MODULE_IID>;
+						reg = <7>;
 						qcom,protection-domain = "avs/audio",
 									 "msm/adsp/audio_pd";
 

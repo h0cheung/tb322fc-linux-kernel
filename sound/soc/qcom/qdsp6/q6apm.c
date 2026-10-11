@@ -154,7 +154,7 @@ static int q6apm_get_apm_state(struct q6apm *apm)
 
 	/* GET_SPF_STATE has no APM command header or payload. */
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_pkt(0,
-				APM_CMD_GET_SPF_STATE, 0, GPR_APM_MODULE_IID);
+				APM_CMD_GET_SPF_STATE, 0, audioreach_get_apm_src_port());
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
@@ -230,7 +230,7 @@ static int __q6apm_map_memory_fixed_region(struct device *dev, unsigned int grap
 	void *p;
 	uint32_t pos_mask = is_pos_buf ? APM_MMAP_TOKEN_MAP_TYPE_POS_BUF : 0;
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_pkt(payload_size,
-			APM_CMD_SHARED_MEM_MAP_REGIONS, graph_id | pos_mask, GPR_APM_MODULE_IID);
+			APM_CMD_SHARED_MEM_MAP_REGIONS, graph_id | pos_mask, audioreach_get_apm_src_port());
 
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
@@ -342,7 +342,7 @@ static int __q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int gr
 	uint32_t mem_map_handle;
 	u32 pos_mask = is_pos_buf ? APM_MMAP_TOKEN_MAP_TYPE_POS_BUF : 0;
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_pkt(sizeof(*cmd),
-			APM_CMD_SHARED_MEM_UNMAP_REGIONS, graph_id | pos_mask, GPR_APM_MODULE_IID);
+			APM_CMD_SHARED_MEM_UNMAP_REGIONS, graph_id | pos_mask, audioreach_get_apm_src_port());
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
@@ -897,6 +897,13 @@ static int apm_probe(gpr_device_t *gdev)
 	idr_init(&apm->modules_idr);
 
 	g_apm = apm;
+
+	/*
+	 * Some ADSP firmwares (e.g. SM8750) only answer the downstream static
+	 * APM GPR client port instead of the mainline one.  Follow the "reg"
+	 * of the q6apm DT node.
+	 */
+	audioreach_set_apm_src_port(gdev->svc_id);
 
 	ret = snd_soc_register_component(dev, &q6apm_audio_component, NULL, 0);
 	if (ret < 0) {
