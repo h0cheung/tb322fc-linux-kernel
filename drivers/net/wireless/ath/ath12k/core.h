@@ -58,6 +58,7 @@
 
 #define ATH12K_INVALID_HW_MAC_ID	0xFF
 #define ATH12K_CONNECTION_LOSS_HZ	(3 * HZ)
+#define ATH12K_BEACON_FRESH_MSECS	3000
 
 #define ATH12K_MON_TIMER_INTERVAL  10
 #define ATH12K_RESET_TIMEOUT_HZ			(20 * HZ)
@@ -329,6 +330,7 @@ struct ath12k_link_vif {
 	u8 bssid[ETH_ALEN];
 	struct cfg80211_bitrate_mask bitrate_mask;
 	struct delayed_work connection_loss_work;
+	unsigned long last_beacon_jiffies;
 	int num_legacy_stations;
 	int rtscts_prot_mode;
 	int txpower;

@@ -2040,6 +2040,11 @@ static void ath12k_mac_handle_beacon_iter(void *data, u8 *mac,
 	if (!ether_addr_equal(mgmt->bssid, vif->bss_conf.bssid))
 		return;
 
+	/* The firmware really does forward beacons for this link, which is the
+	 * only thing that can cancel connection_loss_work.
+	 */
+	arvif->last_beacon_jiffies = jiffies;
+
 	cancel_delayed_work(&arvif->connection_loss_work);
 }
 
@@ -2066,9 +2071,24 @@ void ath12k_mac_handle_beacon_miss(struct ath12k *ar,
 	 * (done by mac80211) succeeds but beacons do not resume then it
 	 * doesn't make sense to continue operation. Queue connection loss work
 	 * which can be cancelled when beacon is received.
+	 *
+	 * Only arm that fallback timer while the cancellation path is actually
+	 * functional, i.e. while the firmware is currently forwarding beacons
+	 * for this link to the host. Some firmware/AP combinations stop
+	 * forwarding beacons entirely for a while (observed on WCN7850 "peach"
+	 * with a phone hotspot: "beacon rx" stays at 1 for the first ~2 minutes
+	 * after associating, while the firmware reports beacon miss every ~17 s
+	 * at -34 dBm RSSI). A single beacon around association is not enough to
+	 * keep this work cancellable, hence the freshness window. Without the
+	 * window every beacon-miss report tears the link down and the driver's
+	 * TX flush times out as well; rely on the mac80211 AP probe triggered
+	 * above instead, as mt76 and rtw89 do.
 	 */
-	ieee80211_queue_delayed_work(hw, &arvif->connection_loss_work,
-				     ATH12K_CONNECTION_LOSS_HZ);
+	if (arvif->last_beacon_jiffies &&
+	    time_before(jiffies, arvif->last_beacon_jiffies +
+				  msecs_to_jiffies(ATH12K_BEACON_FRESH_MSECS)))
+		ieee80211_queue_delayed_work(hw, &arvif->connection_loss_work,
+					     ATH12K_CONNECTION_LOSS_HZ);
 }
 
 static void ath12k_mac_vif_sta_connection_loss_work(struct work_struct *work)
@@ -4101,6 +4121,7 @@ static void ath12k_bss_assoc(struct ath12k *ar,
 	}
 
 	arvif->is_up = true;
+	arvif->last_beacon_jiffies = 0;
 	arvif->rekey_data.enable_offload = false;
 
 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
@@ -4154,6 +4175,7 @@ static void ath12k_bss_disassoc(struct ath12k *ar,
 			    arvif->vdev_id, ret);
 
 	arvif->is_up = false;
+	arvif->last_beacon_jiffies = 0;
 
 	memset(&arvif->rekey_data, 0, sizeof(arvif->rekey_data));
 
