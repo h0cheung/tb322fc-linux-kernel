@@ -39,6 +39,7 @@ static struct msm_dsi_manager msm_dsim_glb = {
 
 static DEFINE_MUTEX(dsi_bonded_cmd_lock);
 static bool dsi_bonded_cmd_failed;
+static int dsi_bonded_cmd_recovery_tries;
 
 #define IS_BONDED_DSI()		(msm_dsim_glb.is_bonded_dsi)
 #define IS_SYNC_NEEDED()	(msm_dsim_glb.is_sync_needed)
@@ -52,6 +53,11 @@ static bool dsi_mgr_uses_bonded_cmd(void)
 bool msm_dsi_manager_cmd_failed(void)
 {
 	return dsi_mgr_uses_bonded_cmd() && READ_ONCE(dsi_bonded_cmd_failed);
+}
+
+void msm_dsi_manager_cmd_reset(void)
+{
+	WRITE_ONCE(dsi_bonded_cmd_failed, false);
 }
 
 static inline struct msm_dsi *dsi_mgr_get_dsi(int id)
@@ -646,6 +652,8 @@ static int dsi_mgr_bonded_cmd_xfer(const struct mipi_dsi_msg *msg)
 		return ret;
 	}
 
+	dsi_bonded_cmd_recovery_tries = 0;
+
 restore_pair:
 	msm_dsi_host_bonded_xfer_restore(master);
 	msm_dsi_host_bonded_xfer_restore(slave);
@@ -653,6 +661,26 @@ restore_pair:
 restore_master:
 	msm_dsi_host_bonded_xfer_restore(master);
 	return ret;
+}
+
+/* Q28: bounded one-shot recovery of the bonded command path.  After a
+ * bonded command failure the global latch makes every later transfer
+ * return -EIO, so the panel driver's init retry can never succeed until a
+ * fresh boot.  Reset both hosts' command path/PHY and clear the latch.
+ */
+static int dsi_mgr_bonded_cmd_recover(void)
+{
+	struct msm_dsi *master_dsi, *slave_dsi;
+
+	master_dsi = dsi_mgr_get_dsi(msm_dsim_glb.master_dsi_link_id);
+	slave_dsi = dsi_mgr_get_other_dsi(msm_dsim_glb.master_dsi_link_id);
+	if (!master_dsi || !slave_dsi || !master_dsi->host || !slave_dsi->host)
+		return -ENODEV;
+
+	msm_dsi_host_reset(master_dsi->host);
+	msm_dsi_host_reset(slave_dsi->host);
+	msm_dsi_manager_cmd_reset();
+	return 0;
 }
 
 int msm_dsi_manager_cmd_xfer(int id, const struct mipi_dsi_msg *msg)
@@ -672,8 +700,15 @@ int msm_dsi_manager_cmd_xfer(int id, const struct mipi_dsi_msg *msg)
 		mutex_lock(&dsi_bonded_cmd_lock);
 
 	if (lock_pair && msm_dsi_manager_cmd_failed()) {
-		ret = -EIO;
-		goto out_unlock;
+		if (dsi_bonded_cmd_recovery_tries++ < 3 &&
+		    dsi_mgr_bonded_cmd_recover() == 0) {
+			dev_warn(&dsi_mgr_get_dsi(id)->pdev->dev,
+				 "bonded cmd failed; host/phy reset, retrying (%d)\n",
+				 dsi_bonded_cmd_recovery_tries);
+		} else {
+			ret = -EIO;
+			goto out_unlock;
+		}
 	}
 
 	if (lock_pair && !is_read && (msg->flags & MIPI_DSI_MSG_REQ_ACK)) {

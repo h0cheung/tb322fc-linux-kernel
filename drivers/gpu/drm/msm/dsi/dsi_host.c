@@ -2905,6 +2905,18 @@ void msm_dsi_host_reset_phy(struct mipi_dsi_host *host)
 	udelay(100);
 }
 
+/* elden Q28: full host recovery (sw_reset + phy reset) so the panel
+ * driver's init retry can actually re-arm the command path.  The
+ * bonded-command failure latch in dsi_manager is cleared by the caller.
+ */
+void msm_dsi_host_reset(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+
+	dsi_sw_reset(msm_host);
+	msm_dsi_host_reset_phy(host);
+}
+
 void msm_dsi_host_get_phy_clk_req(struct mipi_dsi_host *host,
 			struct msm_dsi_phy_clk_request *clk_req,
 			bool is_bonded_dsi)

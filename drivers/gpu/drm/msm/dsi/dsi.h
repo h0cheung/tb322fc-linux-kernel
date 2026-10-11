@@ -53,6 +53,7 @@ int msm_dsi_manager_connector_init(struct msm_dsi *msm_dsi,
 int msm_dsi_manager_cmd_xfer(int id, const struct mipi_dsi_msg *msg);
 int msm_dsi_manager_cmd_xfer_trigger(int id, u32 dma_base, u32 len);
 bool msm_dsi_manager_cmd_failed(void);
+void msm_dsi_manager_cmd_reset(void);
 int msm_dsi_manager_register(struct msm_dsi *msm_dsi);
 void msm_dsi_manager_unregister(struct msm_dsi *msm_dsi);
 void msm_dsi_manager_tpg_enable(void);
@@ -105,6 +106,7 @@ void msm_dsi_host_set_phy_mode(struct mipi_dsi_host *host,
 int msm_dsi_host_set_src_pll(struct mipi_dsi_host *host,
 			struct msm_dsi_phy *src_phy);
 void msm_dsi_host_reset_phy(struct mipi_dsi_host *host);
+void msm_dsi_host_reset(struct mipi_dsi_host *host);
 void msm_dsi_host_get_phy_clk_req(struct mipi_dsi_host *host,
 	struct msm_dsi_phy_clk_request *clk_req,
 	bool is_bonded_dsi);
