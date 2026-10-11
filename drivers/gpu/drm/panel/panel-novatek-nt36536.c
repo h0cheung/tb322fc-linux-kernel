@@ -306,6 +306,18 @@ static struct drm_dsc_config csot_pp8807hb1_1_dsc_cfg = {
 };
 
 static const struct drm_display_mode csot_pp8807hb1_1_modes[] = {
+	/* 165 Hz — preferred (first entry gets DRM_MODE_TYPE_PREFERRED) */
+	{
+		.clock = (952 + 50 + 16 + 16) * 2 * (3040 + 26 + 4 + 50) * 165 / 1000,
+		.hdisplay = 952 * 2,
+		.hsync_start = (952 + 50) * 2,
+		.hsync_end = (952 + 50 + 16) * 2,
+		.htotal = (952 + 50 + 16 + 16) * 2,
+		.vdisplay = 3040,
+		.vsync_start = 3040 + 26,
+		.vsync_end = 3040 + 26 + 4,
+		.vtotal = 3040 + 26 + 4 + 50,
+	},
 	/* 915552 KHz */
 	{
 		.clock = (952 + 138 + 16 + 16) * 2 * (3040 + 26 + 4 + 330) * 120 / 1000,
@@ -363,17 +375,6 @@ static const struct drm_display_mode csot_pp8807hb1_1_modes[] = {
 		.vtotal = 3040 + 13626 + 4 + 330,
 	},
 	/* 1064606.4 KHz */
-	{
-		.clock = (952 + 50 + 16 + 16) * 2 * (3040 + 26 + 4 + 50) * 165 / 1000,
-		.hdisplay = 952 * 2,
-		.hsync_start = (952 + 50) * 2,
-		.hsync_end = (952 + 50 + 16) * 2,
-		.htotal = (952 + 50 + 16 + 16) * 2,
-		.vdisplay = 3040,
-		.vsync_start = 3040 + 26,
-		.vsync_end = 3040 + 26 + 4,
-		.vtotal = 3040 + 26 + 4 + 50,
-	},
 	{
 		.clock = (952 + 50 + 16 + 16) * 2 * (3040 + 481 + 4 + 50) * 144 / 1000,
 		.hdisplay = 952 * 2,
