@@ -348,6 +348,40 @@ static int q6i2s_set_sysclk(struct snd_soc_dai *dai, int clk_id, unsigned int fr
 	return ret;
 }
 
+static int q6i2s_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
+{
+	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+	int rc;
+
+	rc = q6apm_lpass_dai_prepare(substream, dai);
+	if (rc)
+		return rc;
+
+	/*
+	 * Start the graph at prepare time, like the vendor q6apm stack and
+	 * the legacy q6afe stack do.  The MI2S interface clocks only drive
+	 * the pads once APM_CMD_GRAPH_START has completed, so the codec DAPM
+	 * power-up (which runs later, at trigger time) needs a live bit
+	 * clock; and the ADSP expects the sink (BE) graph to be started
+	 * before the source (FE) graph, which also starts in its own prepare.
+	 * The trigger callback keeps its start as a fallback, guarded by
+	 * is_port_started.
+	 */
+	rc = q6apm_graph_start(dai_data->graph[dai->id]);
+	if (rc < 0) {
+		dev_err(dai->dev, "Failed to start APM port %d\n", dai->id);
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+			q6apm_graph_close(dai_data->graph[dai->id]);
+			dai_data->graph[dai->id] = NULL;
+		}
+		return rc;
+	}
+
+	dai_data->is_port_started[dai->id] = true;
+
+	return 0;
+}
+
 static int q6i2s_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 {
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
@@ -368,7 +402,7 @@ static const struct snd_soc_dai_ops q6dma_ops = {
 };
 
 static const struct snd_soc_dai_ops q6i2s_ops = {
-	.prepare	= q6apm_lpass_dai_prepare,
+	.prepare	= q6i2s_prepare,
 	.startup	= q6i2s_dai_startup,
 	.shutdown	= q6i2s_lpass_dai_shutdown,
 	.set_channel_map  = q6dma_set_channel_map,
