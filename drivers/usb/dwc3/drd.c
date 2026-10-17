@@ -523,7 +523,6 @@ static int dwc3_mux_role_set(struct usb_role_switch *sw, enum usb_role role)
 		ret = -ESHUTDOWN;
 		goto out;
 	}
-	WRITE_ONCE(mux->error, 0);
 
 	port->role = role;
 	if (mux->ports[0].role != USB_ROLE_NONE)
@@ -553,8 +552,12 @@ static int dwc3_mux_role_set(struct usb_role_switch *sw, enum usb_role role)
 	dwc->desired_dr_role = mode;
 	spin_unlock_irqrestore(&dwc->lock, flags);
 	queue_work(system_freezable_wq, &dwc->drd_work);
-	flush_work(&dwc->drd_work);
-	ret = READ_ONCE(mux->error);
+	/*
+	 * Role changes are asynchronous, as with a single connector. Waiting
+	 * for a freezable worker here can deadlock system suspend. The worker
+	 * records and logs handover failures; a later request may retry them.
+	 */
+	ret = 0;
 out:
 	mutex_unlock(&mux->lock);
 	return ret;
@@ -569,8 +572,18 @@ static enum usb_role dwc3_mux_role_get(struct usb_role_switch *sw)
 
 	mutex_lock(&mux->lock);
 	spin_lock_irqsave(&port->dwc->lock, flags);
-	if (!READ_ONCE(mux->error) && mux->active_port == port->state)
-		role = port->role;
+	if (!READ_ONCE(mux->error) && mux->active_port == port->state &&
+	    port->role != USB_ROLE_NONE) {
+		/* Report the installed role, not a pending asynchronous request. */
+		switch (port->dwc->current_dr_role) {
+		case DWC3_GCTL_PRTCAP_HOST:
+			role = USB_ROLE_HOST;
+			break;
+		case DWC3_GCTL_PRTCAP_DEVICE:
+			role = USB_ROLE_DEVICE;
+			break;
+		}
+	}
 	spin_unlock_irqrestore(&port->dwc->lock, flags);
 	mutex_unlock(&mux->lock);
 	return role;
