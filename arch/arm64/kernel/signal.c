@@ -22,6 +22,7 @@
 #include <linux/syscalls.h>
 #include <linux/pkeys.h>
 
+#include <asm/cputype.h>
 #include <asm/daifflags.h>
 #include <asm/debug-monitors.h>
 #include <asm/elf.h>
@@ -34,6 +35,7 @@
 #include <asm/ptrace.h>
 #include <asm/syscall.h>
 #include <asm/signal32.h>
+#include <asm/spectre.h>
 #include <asm/traps.h>
 #include <asm/vdso.h>
 
@@ -1010,6 +1012,33 @@ invalid:
 	return -EINVAL;
 }
 
+/* Wine returns through signal frames that lack PSTATE.SSBS. */
+static int ssbd_sigreturn __ro_after_init = -1;
+
+static int __init parse_ssbd_sigreturn(char *str)
+{
+	bool val;
+
+	if (kstrtobool(str, &val))
+		return -EINVAL;
+	ssbd_sigreturn = val;
+	return 0;
+}
+early_param("ssbd_sigreturn", parse_ssbd_sigreturn);
+
+static int __init ssbd_sigreturn_init(void)
+{
+	static const struct midr_range oryon[] = {
+		MIDR_ALL_VERSIONS(MIDR_QCOM_ORYON_X1),
+		{}
+	};
+
+	if (ssbd_sigreturn < 0)
+		ssbd_sigreturn = is_midr_in_range_list(oryon);
+	return 0;
+}
+arch_initcall(ssbd_sigreturn_init);
+
 static int restore_sigframe(struct pt_regs *regs,
 			    struct rt_sigframe __user *sf,
 			    struct user_access_state *ua_state)
@@ -1037,6 +1066,8 @@ static int restore_sigframe(struct pt_regs *regs,
 	fpsimd_save_and_flush_current_state();
 
 	err |= !valid_user_regs(&regs->user_regs, current);
+	if (err == 0 && ssbd_sigreturn > 0)
+		spectre_v4_enable_task_mitigation(current);
 	if (err == 0)
 		err = parse_user_sigframe(&user, sf);
 
